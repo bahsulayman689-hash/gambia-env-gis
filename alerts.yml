@@ -1,0 +1,21 @@
+name: environmental-alerts
+on:
+  schedule:
+    - cron: "0 6 * * *"   # daily 06:00 UTC (= Gambia local time)
+  workflow_dispatch:
+jobs:
+  alerts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install requests
+      - run: python alerts_job.py
+        env:
+          TWILIO_SID: ${{ secrets.TWILIO_SID }}
+          TWILIO_TOKEN: ${{ secrets.TWILIO_TOKEN }}
+          TWILIO_FROM: ${{ secrets.TWILIO_FROM }}
+          ALERT_RECIPIENTS: ${{ secrets.ALERT_RECIPIENTS }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          ORG_NAME: ${{ secrets.ORG_NAME }}
