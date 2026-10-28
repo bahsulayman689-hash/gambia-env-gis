@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.svg" alt="Gambia Env GIS" width="120">
+  <img src="logo.svg" alt="Gambia Env GIS" width="120">
 </p>
 
 <h1 align="center">Gambia Environmental GIS Dashboard</h1>
@@ -61,7 +61,7 @@ flowchart LR
 ## Quick start
 
 ```bash
-git clone https://github.com/<your-username>/gambia-env-gis.git
+git clone https:/bahsulayman689-hash/github.com//gambia-env-gis.git
 cd gambia-env-gis
 pip install -r requirements.txt
 streamlit run app.py
