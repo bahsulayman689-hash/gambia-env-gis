@@ -257,7 +257,79 @@ def build_report(org, df, tw, alerts):
 # ---- white-label + access gate (all optional, set in secrets) ----
 ORG = secret("ORG_NAME") or "Gambia"
 _pw = secret("APP_PASSWORD")
-if _pw and not st.session_state.get("auth"):
+SB_ON = bool(secret("SUPABASE_URL") and secret("SUPABASE_KEY"))
+LOGIN_REQUIRED = SB_ON and str(secret("REQUIRE_LOGIN")).lower() != "false"
+
+
+def sb_auth(path, payload, params=None):
+    """Supabase Auth (GoTrue) REST call. Returns JSON or raises ValueError with a readable message."""
+    r = requests.post(f"{secret('SUPABASE_URL')}/auth/v1/{path}", params=params, json=payload, timeout=30,
+                      headers={"apikey": secret("SUPABASE_KEY"), "Content-Type": "application/json"})
+    j = r.json() if r.content else {}
+    if r.status_code >= 400:
+        raise ValueError(j.get("msg") or j.get("error_description") or j.get("message") or "Request failed")
+    return j
+
+
+def _login(j, fallback_email):
+    u = j.get("user") or {}
+    st.session_state["user"] = {"email": u.get("email", fallback_email),
+                                "name": (u.get("user_metadata") or {}).get("full_name", "")}
+    st.rerun()
+
+
+if LOGIN_REQUIRED and not st.session_state.get("user"):
+    left, right = st.columns([1.1, 1], gap="large")
+    with left:
+        st.markdown(
+            f'<div class="hero" style="min-height:430px"><div style="position:relative;z-index:1">'
+            f'<div class="hero-org">{html.escape(ORG)}</div>'
+            f'<div class="hero-status" style="font-size:2rem">Environmental monitoring for The Gambia</div>'
+            f'<div class="hero-sub">Flood outlook for 15 towns, air quality and dust, heat, fire hotspots and '
+            f'satellite vegetation in one live map. Sign in to open the dashboard.</div></div></div>',
+            unsafe_allow_html=True)
+    with right:
+        t_in, t_up = st.tabs(["Sign in", "Create account"])
+        with t_in:
+            with st.form("signin"):
+                em = st.text_input("Email")
+                pw = st.text_input("Password", type="password")
+                go = st.form_submit_button("Sign in", type="primary", use_container_width=True)
+            if go:
+                try:
+                    _login(sb_auth("token", {"email": em.strip(), "password": pw}, {"grant_type": "password"}), em)
+                except ValueError as e:
+                    st.error(f"Could not sign in: {e}. If you just signed up, confirm your email first.")
+            with st.expander("Forgot your password?"):
+                rem = st.text_input("Account email", key="reset_email")
+                if st.button("Send reset link"):
+                    try:
+                        sb_auth("recover", {"email": rem.strip()})
+                        st.success("If that email has an account, a reset link is on its way.")
+                    except ValueError as e:
+                        st.error(str(e))
+        with t_up:
+            with st.form("signup"):
+                nm = st.text_input("Full name")
+                em2 = st.text_input("Work email")
+                pw2 = st.text_input("Password (at least 8 characters)", type="password")
+                pw3 = st.text_input("Confirm password", type="password")
+                go2 = st.form_submit_button("Create account", type="primary", use_container_width=True)
+            if go2:
+                if len(pw2) < 8:
+                    st.error("Use a password with at least 8 characters.")
+                elif pw2 != pw3:
+                    st.error("The two passwords do not match.")
+                else:
+                    try:
+                        j = sb_auth("signup", {"email": em2.strip(), "password": pw2, "data": {"full_name": nm.strip()}})
+                        if j.get("access_token"):
+                            _login(j, em2)
+                        st.success("Account created. Check your email and confirm it, then sign in.")
+                    except ValueError as e:
+                        st.error(f"Could not create account: {e}")
+    st.stop()
+elif not SB_ON and _pw and not st.session_state.get("auth"):
     st.title(f"🔒 {ORG}")
     code = st.text_input("Access code", type="password")
     if st.button("Enter"):
@@ -273,6 +345,12 @@ if secret("PRIMARY_COLOR"):
 
 # ---------------------------------------------------------------- sidebar
 st.sidebar.markdown("<div class='brand'>Gambia Env GIS</div>", unsafe_allow_html=True)
+if st.session_state.get("user"):
+    _u = st.session_state["user"]
+    st.sidebar.caption(f"Signed in as {_u.get('name') or _u['email']}")
+    if st.sidebar.button("Sign out"):
+        st.session_state.pop("user", None)
+        st.rerun()
 LAYERS = ["Temp (°C)", "PM10 (µg/m³)", "PM2.5 (µg/m³)", "Dust (µg/m³)", "US AQI",
           "Rain next 7d (mm)", "Humidity (%)", "Wind (km/h)", "Composite risk (0-100)"]
 layer = st.sidebar.selectbox("Map layer", LAYERS, index=len(LAYERS) - 1)
