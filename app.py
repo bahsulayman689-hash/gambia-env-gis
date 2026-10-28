@@ -3,11 +3,13 @@ Live weather + air quality/dust (Open-Meteo, no API key), interactive map,
 protected-area layer, 1-year climate history, composite risk index, custom layer upload.
 Run:  streamlit run app.py
 """
+import base64
 import hmac
 import html
 import io
 import json
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import branca.colormap as cm
 import folium
@@ -19,6 +21,45 @@ from folium.plugins import Fullscreen, HeatMap, MiniMap
 from streamlit_folium import st_folium
 
 st.set_page_config(page_title="Gambia Environmental GIS", page_icon="🌍", layout="wide")
+
+px.defaults.template = "plotly_white"
+px.defaults.color_discrete_sequence = ["#0E7C86", "#1C6DD0", "#1F8A5B", "#E08A00", "#C8372D", "#7B5EA7"]
+
+STYLE = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Figtree:wght@400;500;600&display=swap');
+html, body, [class*="css"], .stMarkdown, label, button, input { font-family: 'Figtree', sans-serif; }
+h1, h2, h3, .hero-org, .hero-status, .stat .v { font-family: 'Bricolage Grotesque', sans-serif; letter-spacing: -0.02em; }
+.block-container { padding-top: 1.1rem; max-width: 1400px; }
+header[data-testid="stHeader"] { background: transparent; }
+section[data-testid="stSidebar"] { background: #fff; border-right: 1px solid #dbe5e8; }
+.brand { font-family: 'Bricolage Grotesque', sans-serif; font-size: 1.3rem; font-weight: 700; color: #0B3C49; }
+.hero { position: relative; overflow: hidden; border-radius: 22px; padding: 30px 36px; color: #fff;
+  background: linear-gradient(115deg, #0B3C49 0%, #0E5E6B 55%, #13806F 100%); }
+.hero:after { content: ""; position: absolute; inset: 0; pointer-events: none;
+  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='60' viewBox='0 0 240 60'%3E%3Cpath d='M0 30 Q30 10 60 30 T120 30 T180 30 T240 30' fill='none' stroke='white' stroke-opacity='.10' stroke-width='2'/%3E%3C/svg%3E") repeat;
+  background-size: 240px 60px; }
+.hero-row { position: relative; z-index: 1; display: flex; gap: 22px; align-items: center; }
+.hero-row img { width: 72px; height: 72px; border-radius: 18px; flex: none; }
+.hero-org { font-size: 1rem; font-weight: 500; opacity: .85; }
+.hero-status { font-size: 2.2rem; font-weight: 700; line-height: 1.15; margin: 4px 0 8px; }
+.hero-status .dot { display: inline-block; width: 14px; height: 14px; border-radius: 50%; margin-right: 12px;
+  box-shadow: 0 0 0 5px rgba(255,255,255,.18); vertical-align: middle; }
+.hero-sub { font-size: .95rem; opacity: .8; max-width: 70ch; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px; margin: 18px 0 8px; }
+.stat { background: #fff; border-radius: 14px; padding: 14px 18px; border-left: 6px solid var(--c);
+  box-shadow: 0 1px 3px rgba(16,36,43,.08); }
+.stat .l { color: #5a6f77; font-size: .88rem; }
+.stat .v { font-size: 1.9rem; font-weight: 700; color: #10242B; line-height: 1.2; }
+.stat .d { font-size: .82rem; color: var(--c); font-weight: 600; }
+.stTabs [data-baseweb="tab-list"] { gap: 6px; border-bottom: 1px solid #d5e0e3; }
+.stTabs [data-baseweb="tab"] { font-weight: 600; padding: 10px 18px; }
+iframe { border-radius: 16px; }
+[data-testid="stDataFrame"] { border-radius: 12px; overflow: hidden; }
+@media (max-width: 700px) { .hero { padding: 22px 20px; } .hero-status { font-size: 1.5rem; } .hero-row img { display: none; } }
+</style>
+"""
+st.markdown(STYLE, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------- reference data
 REGIONS = {  # name: (lat, lon)
@@ -227,14 +268,14 @@ if secret("PRIMARY_COLOR"):
     st.markdown(f"<style>h1,h2,h3{{color:{secret('PRIMARY_COLOR')}}}</style>", unsafe_allow_html=True)
 
 # ---------------------------------------------------------------- sidebar
-st.sidebar.title("🌍 Gambia Env GIS")
+st.sidebar.markdown("<div class='brand'>Gambia Env GIS</div>", unsafe_allow_html=True)
 LAYERS = ["Temp (°C)", "PM10 (µg/m³)", "PM2.5 (µg/m³)", "Dust (µg/m³)", "US AQI",
           "Rain next 7d (mm)", "Humidity (%)", "Wind (km/h)", "Composite risk (0-100)"]
 layer = st.sidebar.selectbox("Map layer", LAYERS, index=len(LAYERS) - 1)
 show_sites = st.sidebar.checkbox("Protected areas & wetlands", True)
 show_heat = st.sidebar.checkbox("Heatmap surface", True)
 show_towns = st.sidebar.checkbox("Towns: flood level & issues", True)
-basemap = st.sidebar.selectbox("Basemap", ["OpenStreetMap", "CartoDB positron", "CartoDB dark_matter"])
+basemap = st.sidebar.selectbox("Basemap", ["OpenStreetMap", "CartoDB positron", "CartoDB dark_matter"], index=1)
 up = st.sidebar.file_uploader("Add your own layer (GeoJSON, or CSV with lat, lon, name)",
                               type=["geojson", "json", "csv"])
 if st.sidebar.button("🔄 Refresh data"):
@@ -268,17 +309,52 @@ except Exception as e:
     st.warning(f"Flood data unavailable: {e}")
 
 # ---------------------------------------------------------------- header / KPIs
-st.title(f"{ORG}: Environmental Monitoring Dashboard")
-st.caption("Live conditions from Open-Meteo (weather + CAMS air quality & Saharan dust). "
-           "Updated every 30 min. Risk index = average of heat (>30°C), PM10 and 7-day rainfall (flood) scores.")
+def _logo():
+    try:
+        return base64.b64encode((Path(__file__).parent / "assets" / "logo.svg").read_bytes()).decode()
+    except Exception:
+        return ""
 
-k = st.columns(5)
-k[0].metric("Avg temperature", f"{df['Temp (°C)'].mean():.1f} °C")
-k[1].metric("Avg PM10", f"{df['PM10 (µg/m³)'].mean():.0f} µg/m³")
-k[2].metric("Avg PM2.5", f"{df['PM2.5 (µg/m³)'].mean():.0f} µg/m³")
-k[3].metric("Rain next 7d (avg)", f"{df['Rain next 7d (mm)'].mean():.0f} mm")
+
+lv = tw["Flood level"].value_counts() if tw is not None else {}
+n_hi = int(lv.get("Warning", 0) + lv.get("Severe", 0))
+n_w = int(lv.get("Watch", 0))
+if tw is None:
+    status, dot = "Flood outlook unavailable", "#9fb3b9"
+elif n_hi:
+    status, dot = f"Flood warning in {n_hi} town{'s' if n_hi > 1 else ''}", "#ff6b5e"
+elif n_w:
+    status, dot = f"Flood watch in {n_w} town{'s' if n_w > 1 else ''}", "#ffc233"
+else:
+    status, dot = "No flood alerts for the next 7 days", "#5be3a1"
+_lg = _logo()
+_img = f'<img src="data:image/svg+xml;base64,{_lg}" alt="">' if _lg else ""
+st.markdown(
+    f'<div class="hero"><div class="hero-row">{_img}<div>'
+    f'<div class="hero-org">{html.escape(ORG)}: Environmental Monitor</div>'
+    f'<div class="hero-status"><span class="dot" style="background:{dot}"></span>{status}</div>'
+    f'<div class="hero-sub">Updated {datetime.now():%H:%M} from Open-Meteo and NASA for 15 towns in 8 regions. '
+    f'Flood levels are forecast indicators, not official warnings.</div></div></div></div>',
+    unsafe_allow_html=True)
+
+
+def _short(col, fn):
+    return df.loc[getattr(df[col], fn)(), "Region"].split(" (")[0]
+
+
+def tile(label, value, note, color):
+    return (f'<div class="stat" style="--c:{color}"><div class="l">{label}</div>'
+            f'<div class="v">{value}</div><div class="d">{note}</div></div>')
+
+
 top = df.loc[df["Composite risk (0-100)"].idxmax()]
-k[4].metric("Highest risk", top["Region"].split(" (")[0], f"{top['Composite risk (0-100)']:.0f}/100")
+st.markdown('<div class="stats">' + "".join([
+    tile("Average temperature", f"{df['Temp (°C)'].mean():.1f}°C", f"Hottest: {_short('Temp (°C)', 'idxmax')}", "#E08A00"),
+    tile("Average PM10", f"{df['PM10 (µg/m³)'].mean():.0f} µg/m³", f"Dustiest: {_short('PM10 (µg/m³)', 'idxmax')}. WHO 24h guide: 45", "#A67C52"),
+    tile("Average PM2.5", f"{df['PM2.5 (µg/m³)'].mean():.0f} µg/m³", "WHO 24h guide: 15", "#7B5EA7"),
+    tile("Rain next 7 days", f"{df['Rain next 7d (mm)'].mean():.0f} mm", f"Wettest: {_short('Rain next 7d (mm)', 'idxmax')}", "#1C6DD0"),
+    tile("Highest combined risk", top["Region"].split(" (")[0], f"{top['Composite risk (0-100)']:.0f} out of 100", "#C8372D"),
+]) + "</div>", unsafe_allow_html=True)
 
 alerts = []
 for _, r in df.iterrows():
