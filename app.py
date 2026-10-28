@@ -56,6 +56,10 @@ section[data-testid="stSidebar"] { background: #fff; border-right: 1px solid #db
 .stTabs [data-baseweb="tab"] { font-weight: 600; padding: 10px 18px; }
 iframe { border-radius: 16px; }
 [data-testid="stDataFrame"] { border-radius: 12px; overflow: hidden; }
+.chips { position: relative; z-index: 1; margin-top: 14px; }
+.chip { display: inline-flex; align-items: center; gap: 8px; padding: 6px 14px; margin: 4px 8px 0 0;
+  border-radius: 999px; background: rgba(255,255,255,.14); font-size: .9rem; font-weight: 600; }
+.chip i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
 @media (max-width: 700px) { .hero { padding: 22px 20px; } .hero-status { font-size: 1.5rem; } .hero-row img { display: none; } }
 </style>
 """
@@ -316,17 +320,59 @@ def _logo():
         return ""
 
 
-lv = tw["Flood level"].value_counts() if tw is not None else {}
-n_hi = int(lv.get("Warning", 0) + lv.get("Severe", 0))
-n_w = int(lv.get("Watch", 0))
+OK_C, WATCH_C, ALERT_C, NA_C = "#5be3a1", "#ffc233", "#ff6b5e", "#9fb3b9"
+
+# --- multi-hazard status: flood, heat, air and dust, fire ---
+hazards = []  # (name, state, text)
 if tw is None:
-    status, dot = "Flood outlook unavailable", "#9fb3b9"
-elif n_hi:
-    status, dot = f"Flood warning in {n_hi} town{'s' if n_hi > 1 else ''}", "#ff6b5e"
-elif n_w:
-    status, dot = f"Flood watch in {n_w} town{'s' if n_w > 1 else ''}", "#ffc233"
+    hazards.append(("Flood", "na", "Flood: no data"))
 else:
-    status, dot = "No flood alerts for the next 7 days", "#5be3a1"
+    lv = tw["Flood level"].value_counts()
+    n_hi, n_w = int(lv.get("Warning", 0) + lv.get("Severe", 0)), int(lv.get("Watch", 0))
+    if n_hi:
+        hazards.append(("Flood", "alert", f"Flood: {n_hi} warning, {n_w} watch"))
+    elif n_w:
+        hazards.append(("Flood", "watch", f"Flood: {n_w} town{'s' if n_w > 1 else ''} on watch"))
+    else:
+        hazards.append(("Flood", "ok", "Flood: no alerts"))
+
+n_heat = int((df["Temp (°C)"] >= T_HEAT).sum())
+if n_heat:
+    hazards.append(("Heat", "alert", f"Heat: {n_heat} region{'s' if n_heat > 1 else ''} above {T_HEAT:.0f}°C"))
+elif df["Temp (°C)"].max() >= T_HEAT - 3:
+    hazards.append(("Heat", "watch", f"Heat: up to {df['Temp (°C)'].max():.0f}°C"))
+else:
+    hazards.append(("Heat", "ok", "Heat: normal"))
+
+n_air = int(((df["PM10 (µg/m³)"] >= T_PM10) | (df["US AQI"] >= T_AQI)).sum())
+if n_air:
+    hazards.append(("Air and dust", "alert", f"Air and dust: {n_air} region{'s' if n_air > 1 else ''} above limit"))
+elif df["PM10 (µg/m³)"].max() >= 0.7 * T_PM10:
+    hazards.append(("Air and dust", "watch", f"Air and dust: PM10 up to {df['PM10 (µg/m³)'].max():.0f}"))
+else:
+    hazards.append(("Air and dust", "ok", "Air and dust: good"))
+
+try:
+    n_fire = len(load_fires(firms_key, fire_days)) if firms_key else None
+except Exception:
+    n_fire = None
+if n_fire is None:
+    hazards.append(("Fire", "na", "Fire: add FIRMS key"))
+elif n_fire:
+    hazards.append(("Fire", "watch", f"Fire: {n_fire} hotspot{'s' if n_fire > 1 else ''} in {fire_days} day{'s' if fire_days > 1 else ''}"))
+else:
+    hazards.append(("Fire", "ok", "Fire: none detected"))
+
+COL = {"ok": OK_C, "watch": WATCH_C, "alert": ALERT_C, "na": NA_C}
+active = [(n, st_) for n, st_, _ in hazards if st_ in ("alert", "watch")]
+if not active:
+    status, dot = "All clear across The Gambia", OK_C
+else:
+    status = ", ".join(f"{n.lower()} {'alert' if st_ == 'alert' else 'watch'}" for n, st_ in active)
+    status = status[0].upper() + status[1:]
+    dot = ALERT_C if any(st_ == "alert" for _, st_ in active) else WATCH_C
+chips = "".join(f'<span class="chip"><i style="background:{COL[st_]}"></i>{t}</span>' for _, st_, t in hazards)
+
 _lg = _logo()
 _img = f'<img src="data:image/svg+xml;base64,{_lg}" alt="">' if _lg else ""
 st.markdown(
@@ -334,7 +380,8 @@ st.markdown(
     f'<div class="hero-org">{html.escape(ORG)}: Environmental Monitor</div>'
     f'<div class="hero-status"><span class="dot" style="background:{dot}"></span>{status}</div>'
     f'<div class="hero-sub">Updated {datetime.now():%H:%M} from Open-Meteo and NASA for 15 towns in 8 regions. '
-    f'Flood levels are forecast indicators, not official warnings.</div></div></div></div>',
+    f'These are forecast and satellite indicators, not official warnings.</div></div></div>'
+    f'<div class="chips">{chips}</div></div>',
     unsafe_allow_html=True)
 
 
