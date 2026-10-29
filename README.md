@@ -124,6 +124,20 @@ Click the map or press **Estimate for all towns** on the flooding tab to count m
 
 Searches Sentinel-2 L2A scenes through the Earth Search STAC API (AWS, no key) and reads only a small window of each scene, so it fits Streamlit Community Cloud. Shows true colour, cloud-masked NDVI, vegetation share and an NDVI trend. Needs `rasterio` (in `requirements.txt`). Keep the area small or the detail on Fast/Medium; the Full 10 m mode with a 20 km area reads about 1200 x 1200 pixels per band.
 
+### Profile photos (person in charge)
+
+Run once in the Supabase SQL Editor. Each user can only write to their own folder:
+
+```sql
+insert into storage.buckets (id, name, public) values ('avatars', 'avatars', true);
+create policy "avatar insert" on storage.objects for insert to authenticated
+  with check (bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text);
+create policy "avatar update" on storage.objects for update to authenticated
+  using (bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text);
+```
+
+Signed-in users upload from the sidebar (**Change profile photo**). The photo is cropped to a square, resized to 256 px and shown in a circle in the sidebar and the top banner. Without sign-in the photo lasts only for the current session.
+
 ### Supabase table
 
 ```sql
