@@ -8,6 +8,8 @@ import hmac
 import html
 import io
 import json
+import time
+import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -15,6 +17,8 @@ import branca.colormap as cm
 import folium
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as pgo
+from plotly.subplots import make_subplots
 import requests
 import streamlit as st
 from folium.plugins import Fullscreen, HeatMap, MiniMap
@@ -32,8 +36,14 @@ html, body, [class*="css"], .stMarkdown, label, button, input { font-family: 'Fi
 h1, h2, h3, .hero-org, .hero-status, .stat .v { font-family: 'Bricolage Grotesque', sans-serif; letter-spacing: -0.02em; }
 .block-container { padding-top: 1.1rem; max-width: 1400px; }
 header[data-testid="stHeader"] { background: transparent; }
-section[data-testid="stSidebar"] { background: #fff; border-right: 1px solid #dbe5e8; }
-.brand { font-family: 'Bricolage Grotesque', sans-serif; font-size: 1.3rem; font-weight: 700; color: #0B3C49; }
+section[data-testid="stSidebar"] { background: #123F7A; border-right: none; }
+section[data-testid="stSidebar"] h1, section[data-testid="stSidebar"] h2, section[data-testid="stSidebar"] h3,
+section[data-testid="stSidebar"] label, section[data-testid="stSidebar"] p,
+section[data-testid="stSidebar"] .brand, section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p { color: #fff; }
+section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p { color: rgba(255,255,255,.8); }
+section[data-testid="stSidebar"] button { background: #fff; border: none; }
+section[data-testid="stSidebar"] button p { color: #123F7A; font-weight: 600; }
+.brand { font-family: 'Bricolage Grotesque', sans-serif; font-size: 1.3rem; font-weight: 700; color: #fff; }
 .hero { position: relative; overflow: hidden; border-radius: 22px; padding: 30px 36px; color: #fff;
   background: linear-gradient(115deg, #0B3C49 0%, #0E5E6B 55%, #13806F 100%); }
 .hero:after { content: ""; position: absolute; inset: 0; pointer-events: none;
@@ -209,6 +219,117 @@ def load_towns():
     return pd.DataFrame(rows)
 
 
+MARINE = "https://marine-api.open-meteo.com/v1/marine"
+COAST = [("North coast", 13.55, -17.00), ("Banjul coast", 13.40, -17.00), ("South coast", 13.15, -17.00)]
+INCIDENT_TYPES = ["Flood", "Storm / wind damage", "Coastal erosion", "Fire", "Drought / crop damage",
+                  "Heat or health impact", "Pollution / waste", "Other"]
+SEV_COLORS = {"Minor": "#f1c40f", "Moderate": "#e67e22", "Severe": "#c0392b"}
+
+
+@st.cache_data(ttl=3600, show_spinner="Checking sea conditions…")
+def load_marine():
+    j = get(MARINE, {"latitude": ",".join(str(c[1]) for c in COAST), "longitude": ",".join(str(c[2]) for c in COAST),
+                     "daily": "wave_height_max,wave_period_max", "hourly": "sea_level_height_msl",
+                     "forecast_days": 7, "timezone": "Africa/Banjul"})
+    j = j if isinstance(j, list) else [j]
+    rows = []
+    for (n, la, lo), x in zip(COAST, j):
+        wh = [v for v in x.get("daily", {}).get("wave_height_max", []) if v is not None]
+        wp = [v for v in x.get("daily", {}).get("wave_period_max", []) if v is not None]
+        sl = [v for v in x.get("hourly", {}).get("sea_level_height_msl", []) if v is not None]
+        rows.append({"Coast": n, "lat": la, "lon": lo,
+                     "Max wave (m)": round(max(wh), 1) if wh else None,
+                     "Max wave period (s)": round(max(wp), 1) if wp else None,
+                     "Highest sea level (m)": round(max(sl), 2) if sl else None,
+                     "Lowest sea level (m)": round(min(sl), 2) if sl else None})
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=3600, show_spinner="Checking drought indicators…")
+def load_drought():
+    items = list(REGIONS.items())
+    j = get(FORECAST, {"latitude": ",".join(str(v[0]) for _, v in items), "longitude": ",".join(str(v[1]) for _, v in items),
+                       "daily": "precipitation_sum,et0_fao_evapotranspiration", "hourly": "soil_moisture_0_to_7cm",
+                       "past_days": 14, "forecast_days": 1, "timezone": "Africa/Banjul"})
+    j = j if isinstance(j, list) else [j]
+    rows = []
+    for (n, _), x in zip(items, j):
+        p = [v or 0 for v in x["daily"]["precipitation_sum"][:-1]]
+        dry = 0
+        for v in reversed(p):
+            if v >= 1:
+                break
+            dry += 1
+        sm = [v for v in x.get("hourly", {}).get("soil_moisture_0_to_7cm", []) if v is not None]
+        smv = sm[-1] if sm else None
+        et = x["daily"]["et0_fao_evapotranspiration"][-1] or 0
+        idx = 100 * (0.5 * min(dry / 14, 1) + 0.5 * (1 - min((smv if smv is not None else 0.3) / 0.30, 1)))
+        rows.append({"Region": n, "Dry days (last 14)": dry, "Rain last 14d (mm)": round(sum(p), 1),
+                     "Soil moisture (m³/m³)": None if smv is None else round(smv, 3),
+                     "ET0 today (mm)": round(et, 1), "Drought index (0-100)": round(idx, 1)})
+    return pd.DataFrame(rows)
+
+
+def sb_rest(method, table, token, params=None, body=None):
+    r = requests.request(method, f"{secret('SUPABASE_URL')}/rest/v1/{table}", params=params, timeout=30,
+                         data=json.dumps(body) if body is not None else None,
+                         headers={"apikey": secret("SUPABASE_KEY"), "Authorization": f"Bearer {token}",
+                                  "Content-Type": "application/json", "Prefer": "return=minimal"})
+    if r.status_code >= 400:
+        try:
+            msg = r.json().get("message")
+        except Exception:
+            msg = r.text[:150]
+        raise ValueError(msg or "Request failed")
+    return r.json() if r.content else None
+
+
+@st.cache_data(ttl=60)
+def load_incidents(token):
+    rows = sb_rest("GET", "incidents", token, {"select": "*", "order": "created_at.desc", "limit": "500"})
+    return pd.DataFrame(rows or [])
+
+
+@st.cache_data(ttl=7 * 86400, show_spinner=False)
+def count_buildings(lat, lon, radius=1000):
+    """Mapped OpenStreetMap buildings within `radius` m (exposure proxy; OSM coverage varies)."""
+    q = f'[out:json][timeout:30];way["building"](around:{radius},{lat},{lon});out count;'
+    r = requests.post("https://overpass-api.de/api/interpreter", data={"data": q}, timeout=45,
+                      headers={"User-Agent": "gambia-env-gis"})
+    r.raise_for_status()
+    el = r.json().get("elements", [])
+    return int(el[0]["tags"]["total"]) if el else 0
+
+
+def upload_photo(token, f):
+    data = f.getvalue()
+    if len(data) > 5 * 1024 * 1024:
+        raise ValueError("Photo must be under 5 MB")
+    path = f"{uuid.uuid4().hex}.{(f.name.rsplit('.', 1)[-1] or 'jpg').lower()}"
+    base = secret("SUPABASE_URL")
+    r = requests.post(f"{base}/storage/v1/object/incident-photos/{path}", data=data, timeout=60,
+                      headers={"apikey": secret("SUPABASE_KEY"), "Authorization": f"Bearer {token}",
+                               "Content-Type": f.type or "image/jpeg"})
+    if r.status_code >= 400:
+        raise ValueError("Photo upload failed (is the incident-photos bucket set up?)")
+    return f"{base}/storage/v1/object/public/incident-photos/{path}"
+
+
+@st.cache_data(ttl=1800, show_spinner="Loading timeline…")
+def load_timeline(lat, lon):
+    w = get(FORECAST, {"latitude": lat, "longitude": lon, "past_days": 7, "forecast_days": 7,
+                       "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max",
+                       "timezone": "Africa/Banjul"})
+    a = get(AIR, {"latitude": lat, "longitude": lon, "past_days": 3, "forecast_days": 4,
+                  "hourly": "pm10,pm2_5,dust", "timezone": "Africa/Banjul"})
+    d = pd.DataFrame(w["daily"])
+    d["time"] = pd.to_datetime(d["time"])
+    d["Period"] = ["Past" if t.date() < date.today() else "Forecast" for t in d["time"]]
+    h = pd.DataFrame(a["hourly"])
+    h["time"] = pd.to_datetime(h["time"])
+    return d, h
+
+
 def secret(k):
     try:
         return st.secrets[k]
@@ -273,7 +394,7 @@ def sb_auth(path, payload, params=None):
 
 def _login(j, fallback_email):
     u = j.get("user") or {}
-    st.session_state["user"] = {"email": u.get("email", fallback_email),
+    st.session_state["user"] = {"email": u.get("email", fallback_email), "token": j.get("access_token"),
                                 "name": (u.get("user_metadata") or {}).get("full_name", "")}
     st.rerun()
 
@@ -352,11 +473,12 @@ if st.session_state.get("user"):
         st.session_state.pop("user", None)
         st.rerun()
 LAYERS = ["Temp (°C)", "PM10 (µg/m³)", "PM2.5 (µg/m³)", "Dust (µg/m³)", "US AQI",
-          "Rain next 7d (mm)", "Humidity (%)", "Wind (km/h)", "Composite risk (0-100)"]
-layer = st.sidebar.selectbox("Map layer", LAYERS, index=len(LAYERS) - 1)
+          "Rain next 7d (mm)", "Humidity (%)", "Wind (km/h)", "Drought index (0-100)", "Composite risk (0-100)"]
+layer = st.sidebar.selectbox("Map layer", LAYERS, index=LAYERS.index("Composite risk (0-100)"))
 show_sites = st.sidebar.checkbox("Protected areas & wetlands", True)
 show_heat = st.sidebar.checkbox("Heatmap surface", True)
 show_towns = st.sidebar.checkbox("Towns: flood level & issues", True)
+show_inc = st.sidebar.checkbox("Reported incidents", True)
 basemap = st.sidebar.selectbox("Basemap", ["OpenStreetMap", "CartoDB positron", "CartoDB dark_matter"], index=1)
 up = st.sidebar.file_uploader("Add your own layer (GeoJSON, or CSV with lat, lon, name)",
                               type=["geojson", "json", "csv"])
@@ -389,6 +511,25 @@ try:
 except Exception as e:
     tw = None
     st.warning(f"Flood data unavailable: {e}")
+
+try:
+    mar = load_marine()
+except Exception:
+    mar = None
+try:
+    dr = load_drought()
+    df = df.merge(dr[["Region", "Drought index (0-100)"]], on="Region", how="left")
+except Exception:
+    dr = None
+df["Drought index (0-100)"] = df.get("Drought index (0-100)", pd.Series(0, index=df.index)).fillna(0)
+
+TOKEN = (st.session_state.get("user") or {}).get("token")
+inc, inc_err = None, None
+if SB_ON and TOKEN:
+    try:
+        inc = load_incidents(TOKEN)
+    except Exception as e:
+        inc_err = str(e)
 
 # ---------------------------------------------------------------- header / KPIs
 def _logo():
@@ -440,6 +581,19 @@ elif n_fire:
     hazards.append(("Fire", "watch", f"Fire: {n_fire} hotspot{'s' if n_fire > 1 else ''} in {fire_days} day{'s' if fire_days > 1 else ''}"))
 else:
     hazards.append(("Fire", "ok", "Fire: none detected"))
+
+if mar is not None and mar["Max wave (m)"].notna().any():
+    wv = float(mar["Max wave (m)"].max())
+    lvl = "alert" if wv >= 3 else "watch" if wv >= 2 else "ok"
+    hazards.append(("Sea", lvl, f"Sea: waves up to {wv:.1f} m"))
+else:
+    hazards.append(("Sea", "na", "Sea: no data"))
+if dr is not None:
+    di = float(dr["Drought index (0-100)"].max())
+    lvl = "alert" if di >= 75 else "watch" if di >= 50 else "ok"
+    hazards.append(("Drought", lvl, "Drought: " + {"alert": "severe", "watch": "building", "ok": "none"}[lvl]))
+else:
+    hazards.append(("Drought", "na", "Drought: no data"))
 
 COL = {"ok": OK_C, "watch": WATCH_C, "alert": ALERT_C, "na": NA_C}
 active = [(n, st_) for n, st_, _ in hazards if st_ in ("alert", "watch")]
@@ -514,7 +668,7 @@ if firms_key:
     except Exception as e:
         st.warning(f"FIRMS unavailable: {e}")
 
-tab_map, tab_flood, tab_clim, tab_data = st.tabs(["🗺️ Map", "🌊 Flooding & town issues", "📈 Climate history", "📋 Data & export"])
+tab_map, tab_flood, tab_land, tab_an, tab_inc, tab_clim, tab_data = st.tabs(["🗺️ Map", "🌊 Flooding & town issues", "🌾 Drought & coast", "📊 Analysis", "📝 Incident reports", "📈 Climate history", "📋 Data & export"])
 
 # ---------------------------------------------------------------- map
 with tab_map:
@@ -554,6 +708,20 @@ with tab_map:
                                 popup=folium.Popup(pop, max_width=320),
                                 tooltip=f"{r['Town']}: {r['Flood level']}").add_to(tg)
         tg.add_to(m)
+
+    if show_inc and inc is not None and len(inc) and {"lat", "lon"} <= set(inc.columns):
+        ig = folium.FeatureGroup(name="Reported incidents")
+        for _, r in inc.iterrows():
+            _ph = r.get("photo_url")
+            ph = f'<br><img src="{_ph}" width="240">' if isinstance(_ph, str) and _ph else ""
+            pop = (f"<b>{r.get('type', '')}</b> ({r.get('severity', '')})<br>{r.get('town', '')}<br>"
+                   f"{r.get('description', '') or ''}{ph}<br>Houses: {r.get('houses_affected', 0)}, "
+                   f"people: {r.get('people_affected', 0)}<br><small>{str(r.get('created_at', ''))[:10]}</small>")
+            folium.CircleMarker([r["lat"], r["lon"]], radius=8, color="#222", weight=2, fill=True,
+                                fill_color=SEV_COLORS.get(r.get("severity"), "#888"), fill_opacity=0.95,
+                                popup=folium.Popup(pop, max_width=280),
+                                tooltip=f"{r.get('type', '')}: {r.get('severity', '')}").add_to(ig)
+        ig.add_to(m)
 
     G = "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best"
     if show_ndvi:
@@ -601,10 +769,16 @@ with tab_map:
     clk = (out or {}).get("last_clicked")
     if clk:
         try:
+            st.session_state["picked"] = (clk["lat"], clk["lng"])
             x = flood_metrics([(clk["lat"], clk["lng"])])[0]
             st.info(f"📍 {clk['lat']:.4f}, {clk['lng']:.4f}: rain next 7d {x['rain7']:.0f} mm "
                     f"(max {x['rain_max']:.0f} mm/day) · river discharge {x['discharge']:.1f} m³/s "
                     f"({x['ratio']:.1f}× normal) · flood hazard {x['hazard'] * 100:.0f}/100")
+            try:
+                nb = count_buildings(round(clk["lat"], 3), round(clk["lng"], 3))
+                st.caption(f"Exposure: about {nb:,} mapped buildings within 1 km (OpenStreetMap; coverage varies).")
+            except Exception:
+                st.caption("Exposure estimate unavailable right now.")
         except Exception as e:
             st.warning(f"Could not check that point: {e}")
     else:
@@ -643,6 +817,26 @@ with tab_flood:
         st.dataframe(tw.drop(columns=["lat", "lon", "_rain", "_dates"]), hide_index=True,
                      use_container_width=True,
                      column_config={"Issues": st.column_config.TextColumn(width="large")})
+        st.markdown("##### Exposure: mapped buildings within 1 km")
+        if st.button("Estimate for all towns"):
+            res = {}
+            with st.spinner("Counting buildings from OpenStreetMap…"):
+                for _, r in tw.iterrows():
+                    try:
+                        res[r["Town"]] = count_buildings(round(r["lat"], 3), round(r["lon"], 3))
+                    except Exception:
+                        res[r["Town"]] = None
+                    time.sleep(0.5)
+            st.session_state["bld"] = res
+        if st.session_state.get("bld"):
+            ex = tw[["Town", "Flood level", "Flood risk (0-100)"]].copy()
+            ex["Buildings within 1 km"] = ex["Town"].map(st.session_state["bld"])
+            st.plotly_chart(px.bar(ex.sort_values("Buildings within 1 km"), x="Buildings within 1 km", y="Town",
+                                   orientation="h", color="Flood level", color_discrete_map=LEVEL_COLORS,
+                                   title="Mapped buildings near each town, coloured by flood level"),
+                            use_container_width=True)
+            st.caption("OpenStreetMap coverage varies, so a low count can mean unmapped buildings. "
+                       "This is an exposure proxy, not a population count.")
         pick = st.selectbox("Problems and issues in", tw["Town"])
         row = tw[tw["Town"] == pick].iloc[0]
         st.markdown(f"**{pick}** ({row['Region']}) · flood level **{row['Flood level']}**")
@@ -650,6 +844,181 @@ with tab_flood:
         st.caption("Hazard = max of 7-day rain, peak daily rain, and GloFAS river discharge vs normal. "
                    "Exposure and issue lists are indicative general assessments, not official data. "
                    "Tides, storm surge and street-level drainage are not modelled; confirm with NDMA / NEA / DWR.")
+
+# ---------------------------------------------------------------- drought & coast
+with tab_land:
+    st.subheader("Drought indicators by region")
+    if dr is None:
+        st.info("Drought data is unavailable right now.")
+    else:
+        st.plotly_chart(px.bar(dr.sort_values("Drought index (0-100)"), x="Drought index (0-100)", y="Region",
+                               orientation="h", color="Drought index (0-100)", color_continuous_scale="YlOrBr",
+                               range_color=[0, 100], title="Drought index (dry days + soil moisture)"),
+                        use_container_width=True)
+        st.dataframe(dr, hide_index=True, use_container_width=True)
+    st.subheader("Sea conditions (next 7 days)")
+    if mar is None or not mar["Max wave (m)"].notna().any():
+        st.info("Marine data is unavailable for these points right now.")
+    else:
+        st.dataframe(mar.drop(columns=["lat", "lon"]), hide_index=True, use_container_width=True)
+    st.caption("Indicative only. Drought index = 50% dry days in the last 14 + 50% low soil moisture (0-7 cm). "
+               "Sea status: watch from 2 m waves, alert from 3 m. Offshore model points, not tide-gauge readings.")
+
+# ---------------------------------------------------------------- analysis
+with tab_an:
+    AN = ["Temp (°C)", "Humidity (%)", "Wind (km/h)", "Rain next 7d (mm)", "PM10 (µg/m³)", "PM2.5 (µg/m³)",
+          "Dust (µg/m³)", "US AQI", "Drought index (0-100)", "Composite risk (0-100)"]
+    short = df["Region"].str.split(" (", regex=False).str[0]
+    raw = df[AN]
+    norm = (raw - raw.min()) / (raw.max() - raw.min()).replace(0, 1)
+
+    st.subheader("1. Which regions stand out?")
+    fig = px.imshow(norm.values, x=AN, y=short, color_continuous_scale="YlOrRd", aspect="auto",
+                    labels=dict(color="Relative level"), title="All indicators by region (0 = lowest region, 1 = highest)")
+    fig.update_traces(customdata=raw.values, hovertemplate="%{y}<br>%{x}: %{customdata:.1f}<extra></extra>")
+    st.plotly_chart(fig, use_container_width=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        sel = st.multiselect("Compare regions (radar)", list(short), default=list(short[:3]), key="radar")
+        fr = pgo.Figure()
+        for nm in sel:
+            vals = norm.loc[short[short == nm].index[0]].tolist()
+            fr.add_trace(pgo.Scatterpolar(r=vals + vals[:1], theta=AN + AN[:1], fill="toself", name=nm, opacity=0.55))
+        fr.update_layout(polar=dict(radialaxis=dict(range=[0, 1], showticklabels=False)), title="Region profile comparison")
+        st.plotly_chart(fr, use_container_width=True)
+    with c2:
+        comp = pd.DataFrame({"Region": short,
+                             "Heat": ((df["Temp (°C)"] - 30) / 10).clip(0, 1) * 100 / 3,
+                             "Air (PM10)": (df["PM10 (µg/m³)"] / 150).clip(0, 1) * 100 / 3,
+                             "Rain (flood)": (df["Rain next 7d (mm)"] / 80).clip(0, 1) * 100 / 3}
+                            ).melt("Region", var_name="Driver", value_name="Points")
+        st.plotly_chart(px.bar(comp, x="Points", y="Region", color="Driver", orientation="h",
+                               title="What drives each region's composite risk (max 100)"), use_container_width=True)
+
+    st.subheader("2. How is one town changing?")
+    town_sel = st.selectbox("Town", list(TOWNS), key="an_town")
+    try:
+        d, h = load_timeline(TOWNS[town_sel]["lat"], TOWNS[town_sel]["lon"])
+        ft = make_subplots(specs=[[{"secondary_y": True}]])
+        ft.add_trace(pgo.Bar(x=d["time"], y=d["precipitation_sum"], name="Rain (mm)",
+                             marker_color=["#9db7d5" if p == "Past" else "#1C6DD0" for p in d["Period"]]), secondary_y=False)
+        ft.add_trace(pgo.Scatter(x=d["time"], y=d["temperature_2m_max"], name="Max temp (°C)", line=dict(color="#E08A00")), secondary_y=True)
+        ft.add_trace(pgo.Scatter(x=d["time"], y=d["temperature_2m_min"], name="Min temp (°C)", line=dict(color="#7B5EA7")), secondary_y=True)
+        ft.update_yaxes(title_text="Rain (mm)", secondary_y=False)
+        ft.update_yaxes(title_text="Temperature (°C)", secondary_y=True)
+        ft.update_layout(title=f"{town_sel}: last 7 days and next 7 days (pale bars = past rain)")
+        st.plotly_chart(ft, use_container_width=True)
+        fa_ = px.line(h, x="time", y=["pm10", "pm2_5", "dust"], title=f"{town_sel}: air quality and dust, hourly",
+                      labels={"value": "µg/m³", "time": "", "variable": ""})
+        st.plotly_chart(fa_, use_container_width=True)
+        st.plotly_chart(px.bar(d, x="time", y="wind_speed_10m_max", color="Period",
+                               title=f"{town_sel}: daily maximum wind (km/h)",
+                               labels={"wind_speed_10m_max": "km/h", "time": ""}), use_container_width=True)
+    except Exception as e:
+        st.warning(f"Timeline unavailable: {e}")
+
+    st.subheader("3. How do regions compare over the last 12 months?")
+    regs = st.multiselect("Regions (up to 4)", list(REGIONS), default=list(REGIONS)[:3], key="cmp")
+    frames = []
+    for r in regs[:4]:
+        try:
+            h12 = load_history(*REGIONS[r])
+            mth = h12.set_index("time").resample("MS").agg({"precipitation_sum": "sum", "temperature_2m_max": "mean"}).reset_index()
+            mth["Region"] = r.split(" (")[0]
+            frames.append(mth)
+        except Exception:
+            pass
+    if frames:
+        allm = pd.concat(frames)
+        c3, c4 = st.columns(2)
+        c3.plotly_chart(px.bar(allm, x="time", y="precipitation_sum", color="Region", barmode="group",
+                               title="Monthly rainfall (mm)", labels={"precipitation_sum": "mm", "time": ""}),
+                        use_container_width=True)
+        c4.plotly_chart(px.line(allm, x="time", y="temperature_2m_max", color="Region", markers=True,
+                                title="Average daily maximum temperature by month (°C)",
+                                labels={"temperature_2m_max": "°C", "time": ""}), use_container_width=True)
+
+    st.subheader("4. Towns: rain, exposure and flood level")
+    if tw is not None:
+        st.plotly_chart(px.scatter(tw, x="Rain 7d (mm)", y="Max daily rain (mm)", size="Exposure (1-5)", size_max=28,
+                                   color="Flood level", color_discrete_map=LEVEL_COLORS, hover_name="Town", text="Town",
+                                   title="Rain total vs heaviest day (bubble size = exposure)"), use_container_width=True)
+
+    st.subheader("5. Forecast vs what was reported")
+    if inc is not None and len(inc) and "created_at" in inc.columns:
+        t = inc.copy()
+        t["created_at"] = pd.to_datetime(t["created_at"], utc=True)
+        wk = t.groupby([pd.Grouper(key="created_at", freq="W"), "severity"]).size().reset_index(name="Reports")
+        c5, c6 = st.columns(2)
+        c5.plotly_chart(px.bar(wk, x="created_at", y="Reports", color="severity", color_discrete_map=SEV_COLORS,
+                               title="Incident reports per week", labels={"created_at": ""}), use_container_width=True)
+        cnt = t["town"].value_counts().rename_axis("Town").reset_index(name="Reports")
+        if tw is not None:
+            mm = tw.merge(cnt, on="Town", how="left").fillna({"Reports": 0})
+            c6.plotly_chart(px.scatter(mm, x="Flood risk (0-100)", y="Reports", text="Town", color="Flood level",
+                                       color_discrete_map=LEVEL_COLORS, title="Forecast flood risk vs reports"),
+                            use_container_width=True)
+    else:
+        st.info("Incident analysis appears here once reports are submitted (sign-in and Supabase required).")
+
+# ---------------------------------------------------------------- incidents
+with tab_inc:
+    if st.session_state.get("flash"):
+        st.success(st.session_state.pop("flash"))
+    if not SB_ON:
+        st.info("Incident reporting needs Supabase. See the README for setup.")
+    elif not TOKEN:
+        st.info("Sign in to report and view incidents.")
+    else:
+        c1, c2 = st.columns([1, 1.25], gap="large")
+        with c1:
+            st.subheader("Report an incident")
+            pk = st.session_state.get("picked")
+            town = st.selectbox("Nearest town", list(TOWNS), key="inc_town")
+            d_lat, d_lon = pk if pk else (TOWNS[town]["lat"], TOWNS[town]["lon"])
+            st.caption(f"Using map point {pk[0]:.4f}, {pk[1]:.4f}" if pk else "Tip: click the map first to use an exact point.")
+            with st.form("incident", clear_on_submit=True):
+                typ = st.selectbox("Type", INCIDENT_TYPES)
+                sev = st.select_slider("Severity", ["Minor", "Moderate", "Severe"])
+                desc = st.text_area("What happened?", max_chars=500)
+                a, b = st.columns(2)
+                houses = a.number_input("Houses affected", 0, 100000, 0)
+                ppl = b.number_input("People affected", 0, 1000000, 0)
+                lat = a.number_input("Latitude", value=float(d_lat), format="%.5f", key=f"lat_{d_lat:.5f}")
+                lon = b.number_input("Longitude", value=float(d_lon), format="%.5f", key=f"lon_{d_lon:.5f}")
+                photo = st.file_uploader("Photo (optional, under 5 MB)", type=["jpg", "jpeg", "png"])
+                go = st.form_submit_button("Submit report", type="primary", use_container_width=True)
+            if go:
+                try:
+                    purl = upload_photo(TOKEN, photo) if photo else None
+                    sb_rest("POST", "incidents", TOKEN, body={
+                        "reporter_email": st.session_state["user"]["email"], "type": typ, "severity": sev,
+                        "description": desc.strip(), "lat": lat, "lon": lon, "town": town,
+                        "houses_affected": int(houses), "people_affected": int(ppl),
+                        **({"photo_url": purl} if purl else {})})
+                    load_incidents.clear()
+                    st.session_state["flash"] = "Report submitted. It now shows on the map."
+                    st.rerun()
+                except ValueError as e:
+                    st.error(f"Could not save: {e}. If your session expired, sign out and sign in again.")
+        with c2:
+            st.subheader("Reported damage")
+            if inc_err:
+                st.error(f"Could not load reports: {inc_err}")
+            elif inc is None or not len(inc):
+                st.info("No reports yet. Submit the first one.")
+            else:
+                k = st.columns(4)
+                k[0].metric("Reports", len(inc))
+                k[1].metric("Severe", int((inc["severity"] == "Severe").sum()))
+                k[2].metric("Houses affected", int(inc["houses_affected"].fillna(0).sum()))
+                k[3].metric("People affected", int(inc["people_affected"].fillna(0).sum()))
+                st.plotly_chart(px.bar(inc["type"].value_counts().reset_index(), x="count", y="type", orientation="h",
+                                       title="Reports by type"), use_container_width=True)
+                show = inc[["created_at", "town", "type", "severity", "houses_affected", "people_affected", "description"] + (["photo_url"] if "photo_url" in inc.columns else [])].head(50)
+                st.dataframe(show, hide_index=True, use_container_width=True)
+                st.download_button("⬇️ Download reports (CSV)", inc.to_csv(index=False), "incidents.csv", "text/csv")
 
 # ---------------------------------------------------------------- history
 with tab_clim:
