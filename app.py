@@ -330,6 +330,24 @@ def load_timeline(lat, lon):
     return d, h
 
 
+@st.cache_data(ttl=3600, show_spinner="Searching Sentinel-2 scenes…")
+def s2_search(lat, lon, half, start, end, cloud):
+    import sentinel
+    return sentinel.search(lat, lon, half, start, end, cloud)
+
+
+@st.cache_data(ttl=86400, show_spinner=False, max_entries=200)
+def s2_stats(fid, bbox, max_px, _feature):
+    import sentinel
+    return sentinel.stats(_feature, list(bbox), max_px)
+
+
+@st.cache_data(ttl=86400, show_spinner="Reading Sentinel-2 pixels…", max_entries=6)
+def s2_scene(fid, bbox, max_px, _feature):
+    import sentinel
+    return sentinel.load_scene(_feature, list(bbox), max_px)
+
+
 def secret(k):
     try:
         return st.secrets[k]
@@ -668,7 +686,7 @@ if firms_key:
     except Exception as e:
         st.warning(f"FIRMS unavailable: {e}")
 
-tab_map, tab_flood, tab_land, tab_an, tab_inc, tab_clim, tab_data = st.tabs(["🗺️ Map", "🌊 Flooding & town issues", "🌾 Drought & coast", "📊 Analysis", "📝 Incident reports", "📈 Climate history", "📋 Data & export"])
+tab_map, tab_flood, tab_land, tab_an, tab_s2, tab_inc, tab_clim, tab_data = st.tabs(["🗺️ Map", "🌊 Flooding & town issues", "🌾 Drought & coast", "📊 Analysis", "🛰️ Sentinel-2", "📝 Incident reports", "📈 Climate history", "📋 Data & export"])
 
 # ---------------------------------------------------------------- map
 with tab_map:
@@ -961,6 +979,86 @@ with tab_an:
                             use_container_width=True)
     else:
         st.info("Incident analysis appears here once reports are submitted (sign-in and Supabase required).")
+
+# ---------------------------------------------------------------- sentinel-2
+with tab_s2:
+    try:
+        import sentinel  # noqa: F401
+        s2_ok = True
+    except Exception as e:
+        s2_ok = False
+        st.info(f"Sentinel-2 needs the rasterio package (see requirements.txt). Details: {e}")
+    if s2_ok:
+        a, b, c, d = st.columns(4)
+        tn = a.selectbox("Town", list(TOWNS), key="s2_town")
+        half = b.select_slider("Area half-width (km)", [2, 5, 10, 20], value=5, key="s2_half")
+        days = c.select_slider("Look back (days)", [30, 60, 120, 365], value=120, key="s2_days")
+        cloud = d.slider("Max scene cloud cover (%)", 5, 80, 30, key="s2_cloud")
+        detail = st.radio("Detail", ["Fast (about 100 m)", "Medium (about 40 m)", "Full (10 m)"], index=1, horizontal=True)
+        max_px = {"Fast (about 100 m)": 250, "Medium (about 40 m)": 500, "Full (10 m)": 1200}[detail]
+        tt = TOWNS[tn]
+        try:
+            t0 = time.perf_counter()
+            bbox, feats = s2_search(tt["lat"], tt["lon"], half, str(date.today() - timedelta(days=days)),
+                                    str(date.today()), cloud)
+            t_search = time.perf_counter() - t0
+        except Exception as e:
+            bbox, feats, t_search = None, [], 0
+            st.error(f"Scene search failed: {e}")
+        if bbox and not feats:
+            st.warning("No scenes under that cloud limit in this period. Raise the cloud limit or look back further. "
+                       "Heavy cloud is normal in the rainy season (about June to October).")
+        if feats:
+            rows = [{"Date": f["properties"]["datetime"][:10], "Scene cloud (%)": round(f["properties"].get("eo:cloud_cover", 0), 1),
+                     "Scene": f["id"]} for f in feats]
+            sc = pd.DataFrame(rows)
+            st.caption(f"{len(feats)} scene(s) found in {t_search:.1f} s. Sentinel-2 passes each place about every 5 days.")
+            pick_i = st.selectbox("Scene", range(len(sc)), format_func=lambda i: f"{sc.Date[i]} ({sc['Scene cloud (%)'][i]:.0f}% cloud)")
+            f_sel = feats[pick_i]
+            bkey = tuple(round(x, 4) for x in bbox)
+            if st.button("Load this scene", type="primary"):
+                try:
+                    st.session_state["s2_res"] = s2_scene(f_sel["id"], bkey, max_px, f_sel)
+                except Exception as e:
+                    st.error(f"Could not read this scene: {e}")
+            res = st.session_state.get("s2_res")
+            if res and res["id"] == f_sel["id"]:
+                k = st.columns(5)
+                k[0].metric("Mean NDVI", res["mean_ndvi"] if res["mean_ndvi"] is not None else "n/a")
+                k[1].metric("Dense vegetation", f"{res['veg_pct']}%" if res["veg_pct"] is not None else "n/a", help="Share of clear pixels with NDVI above 0.3")
+                k[2].metric("Cloud in view", f"{res['cloud_pct']}%")
+                k[3].metric("Usable pixels", f"{res['usable_pct']}%")
+                k[4].metric("Load time", f"{res['seconds']} s", f"{res['pixels']:,} pixels")
+                m2 = folium.Map(location=[tt["lat"], tt["lon"]], zoom_start={2: 13, 5: 12, 10: 11, 20: 10}[half], tiles="CartoDB positron")
+                folium.raster_layers.ImageOverlay(image=res["rgb"], bounds=res["bounds"], opacity=0.95, name="True colour").add_to(m2)
+                folium.raster_layers.ImageOverlay(image=res["ndvi_rgba"], bounds=res["bounds"], opacity=0.85, name="NDVI").add_to(m2)
+                folium.LayerControl(collapsed=False).add_to(m2)
+                st_folium(m2, height=520, use_container_width=True, returned_objects=[])
+                st.caption("NDVI colours: blue = water, brown = bare soil, yellow = sparse, green = dense vegetation. "
+                           "Clouds, shadows and missing pixels are transparent. Overlay position is approximate.")
+                vv = res["ndvi"][~pd.isna(res["ndvi"])]
+                if len(vv):
+                    st.plotly_chart(px.histogram(x=vv.ravel(), nbins=40, title="NDVI distribution (clear pixels)",
+                                                 labels={"x": "NDVI"}), use_container_width=True)
+            st.markdown("##### NDVI trend over the scenes found")
+            if st.button("Compute trend (latest 8 scenes, fast mode)"):
+                out = []
+                with st.spinner("Reading scenes…"):
+                    for f in feats[:8]:
+                        try:
+                            out.append(s2_stats(f["id"], bkey, 200, f))
+                        except Exception:
+                            pass
+                st.session_state["s2_trend"] = pd.DataFrame(out)
+            tr = st.session_state.get("s2_trend")
+            if tr is not None and len(tr):
+                tr = tr.sort_values("date")
+                st.plotly_chart(px.line(tr, x="date", y="mean_ndvi", markers=True, hover_data=["cloud_pct", "usable_pct"],
+                                        title=f"Mean NDVI around {tn}", labels={"mean_ndvi": "NDVI", "date": ""}),
+                                use_container_width=True)
+                st.dataframe(tr[["date", "mean_ndvi", "veg_pct", "cloud_pct", "usable_pct", "seconds"]], hide_index=True, use_container_width=True)
+        st.caption("Source: Copernicus Sentinel-2 L2A via Earth Search (Element 84, AWS), free with no key. "
+                   "Typically clearest from about November to May, but vegetation is also drier then. Verify the licence for commercial use.")
 
 # ---------------------------------------------------------------- incidents
 with tab_inc:

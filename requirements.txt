@@ -6,3 +6,4 @@ plotly>=5.20
 pandas>=2.0
 numpy
 requests>=2.31
+rasterio>=1.3
