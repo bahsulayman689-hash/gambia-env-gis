@@ -103,6 +103,27 @@ create policy "insert incidents" on incidents for insert to authenticated with c
 
 Reports appear as coloured dots on the map (yellow minor, orange moderate, red severe). Sessions last about an hour; if saving fails, sign out and in again.
 
+### Incident photos (optional)
+
+Run once in the Supabase SQL Editor:
+
+```sql
+alter table incidents add column photo_url text;
+insert into storage.buckets (id, name, public) values ('incident-photos', 'incident-photos', true);
+create policy "upload photos" on storage.objects for insert to authenticated
+  with check (bucket_id = 'incident-photos');
+```
+
+Photos are public by URL, so tell reporters not to photograph faces or private documents. If a photo fails to upload, the whole report is not saved.
+
+### Exposure (buildings near a point)
+
+Click the map or press **Estimate for all towns** on the flooding tab to count mapped OpenStreetMap buildings within 1 km (Overpass API, no key, cached 7 days). OSM coverage varies, so treat it as a proxy, not a population count.
+
+### Sentinel-2 tab
+
+Searches Sentinel-2 L2A scenes through the Earth Search STAC API (AWS, no key) and reads only a small window of each scene, so it fits Streamlit Community Cloud. Shows true colour, cloud-masked NDVI, vegetation share and an NDVI trend. Needs `rasterio` (in `requirements.txt`). Keep the area small or the detail on Fast/Medium; the Full 10 m mode with a 20 km area reads about 1200 x 1200 pixels per band.
+
 ### Supabase table
 
 ```sql
