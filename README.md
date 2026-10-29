@@ -61,7 +61,7 @@ flowchart LR
 ## Quick start
 
 ```bash
-git clone https:/bahsulayman689-hash/github.com//gambia-env-gis.git
+git clone https://github.com/<your-username>/gambia-env-gis.git
 cd gambia-env-gis
 pip install -r requirements.txt
 streamlit run app.py
@@ -77,6 +77,31 @@ Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`, or paste th
 | `APP_PASSWORD` | Access code (remove for a public app) |
 | `FIRMS_KEY` | Fire hotspots. Free at https://firms.modaps.eosdis.nasa.gov/api/map_key |
 | `SUPABASE_URL`, `SUPABASE_KEY` | Log alerts to Supabase (anon key) |
+
+### Accounts (sign in / create account)
+
+With `SUPABASE_URL` and `SUPABASE_KEY` set, the app shows a **Sign in / Create account** page (Supabase Auth). Set `REQUIRE_LOGIN = "false"` to keep the app public. Without Supabase, `APP_PASSWORD` is used as a simple access code.
+
+In Supabase: **Authentication > Providers > Email** must be enabled. Under **Authentication > URL Configuration**, set **Site URL** to your Streamlit app URL so confirmation and reset links come back to the app. To restrict access to invited users only, turn off new sign-ups and use **Authentication > Users > Invite user**.
+
+### Incident reports table
+
+Signed-in users can report real damage (type, severity, houses and people affected, location). Run this once in the Supabase SQL Editor:
+
+```sql
+create table incidents (
+  id bigint generated always as identity primary key,
+  created_at timestamptz default now(),
+  reporter_email text, type text, severity text, description text,
+  lat float8, lon float8, town text,
+  houses_affected int default 0, people_affected int default 0
+);
+alter table incidents enable row level security;
+create policy "read incidents" on incidents for select to authenticated using (true);
+create policy "insert incidents" on incidents for insert to authenticated with check (true);
+```
+
+Reports appear as coloured dots on the map (yellow minor, orange moderate, red severe). Sessions last about an hour; if saving fails, sign out and in again.
 
 ### Supabase table
 
