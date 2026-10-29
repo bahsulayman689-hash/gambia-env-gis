@@ -350,9 +350,14 @@ def s2_scene(fid, bbox, max_px, _feature):
 
 def secret(k):
     try:
-        return st.secrets[k]
+        v = st.secrets[k]
     except Exception:
         return None
+    if k == "SUPABASE_URL" and v:  # keep only https://<project>.supabase.co, even if a longer URL was pasted
+        from urllib.parse import urlparse
+        u = urlparse(str(v).strip())
+        return f"{u.scheme}://{u.netloc}" if u.scheme and u.netloc else str(v).strip().rstrip("/")
+    return v
 
 
 @st.cache_data(ttl=3600, show_spinner="Fetching NASA FIRMS fire hotspots…")
@@ -371,7 +376,8 @@ def log_alerts(rows):
     """Insert alerts into Supabase table `alerts` (see README.md for SQL)."""
     r = requests.post(f"{secret('SUPABASE_URL')}/rest/v1/alerts",
                       headers={"apikey": secret("SUPABASE_KEY"),
-                               "Authorization": f"Bearer {secret('SUPABASE_KEY')}",
+                               **({"Authorization": f"Bearer {secret('SUPABASE_KEY')}"}
+                                  if str(secret("SUPABASE_KEY")).startswith("eyJ") else {}),
                                "Content-Type": "application/json"},
                       data=json.dumps(rows), timeout=30)
     r.raise_for_status()

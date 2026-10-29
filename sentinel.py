@@ -9,7 +9,6 @@ from rasterio.enums import Resampling
 from rasterio.warp import transform_bounds
 from rasterio.windows import from_bounds
 
-# Ensure this exact gateway path is used to query the data engine properly
 STAC = "https://earth-search.aws.element84.com/v1/search"
 BAD_SCL = [0, 1, 3, 8, 9, 10]      # no data, saturated, cloud shadow, cloud (medium/high), thin cirrus
 CLOUD_SCL = [3, 8, 9, 10]
@@ -20,21 +19,24 @@ ENV = dict(GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR", AWS_NO_SIGN_REQUEST="YES",
 
 def search(lat, lon, half_km, start, end, max_cloud):
     dlat = half_km / 111.0
-    dlon = half_km / (111.0 * np.cos(np.radians(lat)))
-    bbox = [lon - dlon, lat - dlat, lon + dlon, lat + dlat]
-    
-    # Enforces current catalog mapping with standardized timestamp ranges
-    body = {
-        "collections": ["sentinel-2-c1-l2a"], 
-        "bbox": bbox, 
-        "datetime": f"{start}T00:00:00Z/{end}T23:59:59Z", 
-        "limit": 100,
-        "query": {"eo:cloud_cover": {"lt": max_cloud}},
-        "sortby": [{"field": "properties.datetime", "direction": "desc"}]
-    }
-    
-    r = requests.post(STAC, json=body, timeout=30)
-    r.raise_for_status()
+    dlon = half_km / (111.0 * float(np.cos(np.radians(lat))))
+    bbox = [round(float(x), 5) for x in (lon - dlon, lat - dlat, lon + dlon, lat + dlat)]
+    dt = f"{str(start)[:10]}T00:00:00Z/{str(end)[:10]}T23:59:59Z"   # STAC wants full RFC 3339 timestamps
+    full = {"collections": ["sentinel-2-l2a"], "bbox": bbox, "datetime": dt, "limit": 100,
+            "query": {"eo:cloud_cover": {"lt": float(max_cloud)}},
+            "sortby": [{"field": "properties.datetime", "direction": "desc"}]}
+    r = requests.post(STAC, json=full, timeout=30)
+    if r.status_code == 400:   # retry with the simplest request, then filter and sort here
+        simple = {"collections": ["sentinel-2-l2a"], "bbox": bbox, "datetime": dt, "limit": 100}
+        r = requests.post(STAC, json=simple, timeout=30)
+        if r.status_code >= 400:
+            raise ValueError(f"{r.status_code} from Earth Search: {r.text[:300]}")
+        feats = [f for f in r.json().get("features", [])
+                 if f["properties"].get("eo:cloud_cover", 100) < max_cloud]
+        feats.sort(key=lambda f: f["properties"]["datetime"], reverse=True)
+        return bbox, feats
+    if r.status_code >= 400:
+        raise ValueError(f"{r.status_code} from Earth Search: {r.text[:300]}")
     return bbox, r.json().get("features", [])
 
 
