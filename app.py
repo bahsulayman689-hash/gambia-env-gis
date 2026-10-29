@@ -70,7 +70,18 @@ iframe { border-radius: 16px; }
 .chip { display: inline-flex; align-items: center; gap: 8px; padding: 6px 14px; margin: 4px 8px 0 0;
   border-radius: 999px; background: rgba(255,255,255,.14); font-size: .9rem; font-weight: 600; }
 .chip i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
-@media (max-width: 700px) { .hero { padding: 22px 20px; } .hero-status { font-size: 1.5rem; } .hero-row img { display: none; } }
+.avatar-wrap { text-align: center; margin: 6px 0 10px; }
+.avatar { width: 92px; height: 92px; border-radius: 50%; object-fit: cover; border: 3px solid rgba(255,255,255,.9);
+  display: block; margin: 0 auto; }
+.avatar.ph { display: flex; align-items: center; justify-content: center; background: #0E7C86; color: #fff;
+  font: 700 1.8rem 'Bricolage Grotesque', sans-serif; }
+.avatar-name { color: #fff; font-weight: 600; margin-top: 8px; }
+.avatar-role { color: rgba(255,255,255,.75); font-size: .85rem; }
+.hero-person { position: relative; z-index: 1; margin-left: auto; text-align: center; min-width: 110px; }
+.hero-person .avatar { width: 84px; height: 84px; }
+.hero-pname { font-weight: 600; margin-top: 6px; }
+.hero-prole { font-size: .8rem; opacity: .75; }
+@media (max-width: 700px) { .hero { padding: 22px 20px; } .hero-status { font-size: 1.5rem; } .hero-row img, .hero-person { display: none; } }
 </style>
 """
 st.markdown(STYLE, unsafe_allow_html=True)
@@ -418,8 +429,10 @@ def sb_auth(path, payload, params=None):
 
 def _login(j, fallback_email):
     u = j.get("user") or {}
+    meta = u.get("user_metadata") or {}
     st.session_state["user"] = {"email": u.get("email", fallback_email), "token": j.get("access_token"),
-                                "name": (u.get("user_metadata") or {}).get("full_name", "")}
+                                "id": u.get("id"), "avatar": meta.get("avatar_url", ""),
+                                "name": meta.get("full_name", "")}
     st.rerun()
 
 
@@ -488,8 +501,58 @@ if secret("ORG_LOGO_URL"):
 if secret("PRIMARY_COLOR"):
     st.markdown(f"<style>h1,h2,h3{{color:{secret('PRIMARY_COLOR')}}}</style>", unsafe_allow_html=True)
 
+def _person():
+    u = st.session_state.get("user") or {}
+    name = u.get("name") or u.get("email") or ORG
+    src = u.get("avatar") or ""
+    if not src and st.session_state.get("avatar_bytes"):
+        src = "data:image/jpeg;base64," + base64.b64encode(st.session_state["avatar_bytes"]).decode()
+    parts = str(name).split()
+    ini = (parts[0][0] + (parts[1][0] if len(parts) > 1 else "")).upper() if parts else "?"
+    inner = f'<img class="avatar" src="{html.escape(src)}" alt="Profile photo">' if src else f'<div class="avatar ph">{html.escape(ini)}</div>'
+    return name, src, inner
+
+
+def save_avatar(f):
+    from PIL import Image
+    if f.size > 5 * 1024 * 1024:
+        raise ValueError("Photo must be under 5 MB")
+    im = Image.open(f).convert("RGB")
+    w, h = im.size
+    m = min(w, h)
+    im = im.crop(((w - m) // 2, (h - m) // 2, (w - m) // 2 + m, (h - m) // 2 + m)).resize((256, 256))
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=88)
+    data = buf.getvalue()
+    u = st.session_state.get("user")
+    if SB_ON and u and u.get("token") and u.get("id"):
+        base, key, tok = secret("SUPABASE_URL"), secret("SUPABASE_KEY"), u["token"]
+        r = requests.post(f"{base}/storage/v1/object/avatars/{u['id']}/avatar.jpg", data=data, timeout=60,
+                          headers={"apikey": key, "Authorization": f"Bearer {tok}", "Content-Type": "image/jpeg",
+                                   "x-upsert": "true"})
+        if r.status_code >= 400:
+            raise ValueError("Upload failed. Is the avatars bucket set up, and is your session still valid?")
+        url = f"{base}/storage/v1/object/public/avatars/{u['id']}/avatar.jpg?v={int(time.time())}"
+        requests.put(f"{base}/auth/v1/user", json={"data": {"avatar_url": url}}, timeout=30,
+                     headers={"apikey": key, "Authorization": f"Bearer {tok}", "Content-Type": "application/json"})
+        u["avatar"] = url
+    else:
+        st.session_state["avatar_bytes"] = data   # not signed in: kept for this session only
+
+
 # ---------------------------------------------------------------- sidebar
 st.sidebar.markdown("<div class='brand'>Gambia Env GIS</div>", unsafe_allow_html=True)
+_pn, _psrc, _pinner = _person()
+st.sidebar.markdown(f'<div class="avatar-wrap">{_pinner}<div class="avatar-name">{html.escape(str(_pn))}</div>'
+                    f'<div class="avatar-role">Person in charge</div></div>', unsafe_allow_html=True)
+with st.sidebar.expander("Change profile photo"):
+    _up = st.file_uploader("Profile photo", type=["jpg", "jpeg", "png"], key="avatar_up", label_visibility="collapsed")
+    if _up is not None and st.button("Save photo"):
+        try:
+            save_avatar(_up)
+            st.rerun()
+        except Exception as e:
+            st.error(str(e))
 if st.session_state.get("user"):
     _u = st.session_state["user"]
     st.sidebar.caption(f"Signed in as {_u.get('name') or _u['email']}")
@@ -629,6 +692,10 @@ else:
     dot = ALERT_C if any(st_ == "alert" for _, st_ in active) else WATCH_C
 chips = "".join(f'<span class="chip"><i style="background:{COL[st_]}"></i>{t}</span>' for _, st_, t in hazards)
 
+_hn, _hsrc, _hinner = _person()
+_person_html = (f'<div class="hero-person">{_hinner}<div class="hero-pname">{html.escape(str(_hn))}</div>'
+                f'<div class="hero-prole">Person in charge</div></div>'
+                if (_hsrc or st.session_state.get("user")) else "")
 _lg = _logo()
 _img = f'<img src="data:image/svg+xml;base64,{_lg}" alt="">' if _lg else ""
 st.markdown(
@@ -636,7 +703,7 @@ st.markdown(
     f'<div class="hero-org">{html.escape(ORG)}: Environmental Monitor</div>'
     f'<div class="hero-status"><span class="dot" style="background:{dot}"></span>{status}</div>'
     f'<div class="hero-sub">Updated {datetime.now():%H:%M} from Open-Meteo and NASA for 15 towns in 8 regions. '
-    f'These are forecast and satellite indicators, not official warnings.</div></div></div>'
+    f'These are forecast and satellite indicators, not official warnings.</div></div>{_person_html}</div>'
     f'<div class="chips">{chips}</div></div>',
     unsafe_allow_html=True)
 
