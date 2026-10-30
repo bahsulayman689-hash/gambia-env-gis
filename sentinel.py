@@ -67,9 +67,10 @@ def _scale_offset(f, key):
     return rb.get("scale", 0.0001), rb.get("offset", off)
 
 
-def ndvi(f, bbox, max_px):
+def ndvi(f, bbox, max_px, shape=None):
     a = f["assets"]
-    shape, bounds = _geometry(a["red"]["href"], bbox, max_px)
+    shape0, bounds = _geometry(a["red"]["href"], bbox, max_px)
+    shape = tuple(shape) if shape else shape0
     red = _read(a["red"]["href"], bbox, shape)[0].astype("float32")
     nir = _read(a["nir"]["href"], bbox, shape)[0].astype("float32")
     scl = _read(a["scl"]["href"], bbox, shape, resampling=Resampling.nearest)[0]
@@ -122,3 +123,58 @@ def load_scene(f, bbox, max_px):
     out = _summary(f, v, c, time.perf_counter() - t, shape)
     out.update(ndvi=v, ndvi_rgba=colorize(v), rgb=rgb, bounds=bounds)
     return out
+
+
+def field_ndvi(f, geom, max_px=600):
+    """Mean NDVI inside a polygon (GeoJSON geometry, lon/lat) for one scene."""
+    from rasterio.features import geometry_mask
+    from rasterio.transform import from_bounds as tfb
+    from rasterio.warp import transform_geom
+    ring = geom["coordinates"][0]
+    xs, ys = [c[0] for c in ring], [c[1] for c in ring]
+    pad = 0.0005
+    bbox = [min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad]
+    with rasterio.Env(**ENV), rasterio.open(f["assets"]["red"]["href"]) as ds:
+        crs = ds.crs
+        b = transform_bounds("EPSG:4326", crs, *bbox)
+    v, cloud_pct, _, _ = ndvi(f, bbox, max_px)
+    inside = geometry_mask([transform_geom("EPSG:4326", crs, geom)], out_shape=v.shape,
+                           transform=tfb(*b, v.shape[1], v.shape[0]), invert=True, all_touched=True)
+    vals = v[inside & ~np.isnan(v)]
+    total = int(inside.sum())
+    return {"id": f["id"], "date": f["properties"]["datetime"][:10], "scene_cloud": f["properties"].get("eo:cloud_cover"),
+            "mean_ndvi": round(float(vals.mean()), 3) if len(vals) else None,
+            "p10": round(float(np.percentile(vals, 10)), 3) if len(vals) else None,
+            "p90": round(float(np.percentile(vals, 90)), 3) if len(vals) else None,
+            "valid_pct": round(100 * len(vals) / max(total, 1), 1), "field_pixels": total,
+            "cloud_pct": round(float(cloud_pct), 1)}
+
+
+def colorize_diff(d):
+    stops = [-0.4, -0.1, 0.0, 0.1, 0.4]
+    cols = np.array([[200, 55, 45], [240, 170, 120], [245, 245, 245], [150, 210, 130], [31, 138, 91]])
+    x = np.nan_to_num(d, nan=0.0)
+    out = np.zeros(d.shape + (4,), np.uint8)
+    for i in range(3):
+        out[..., i] = np.interp(x, stops, cols[:, i]).astype(np.uint8)
+    out[..., 3] = np.where(np.isnan(d), 0, 235)
+    return out
+
+
+def change(f1, f2, bbox, max_px):
+    """NDVI change between two scenes (after minus before) over the same window."""
+    t = time.perf_counter()
+    v1, c1, bounds, shape = ndvi(f1, bbox, max_px)
+    v2, c2, _, _ = ndvi(f2, bbox, max_px, shape=shape)
+    d = v2 - v1
+    ok = ~np.isnan(d)
+    return {"before_date": f1["properties"]["datetime"][:10], "after_date": f2["properties"]["datetime"][:10],
+            "before_cloud": f1["properties"].get("eo:cloud_cover"), "after_cloud": f2["properties"].get("eo:cloud_cover"),
+            "mean_before": round(float(np.nanmean(v1)), 3) if (~np.isnan(v1)).any() else None,
+            "mean_after": round(float(np.nanmean(v2)), 3) if (~np.isnan(v2)).any() else None,
+            "mean_change": round(float(d[ok].mean()), 3) if ok.any() else None,
+            "gain_pct": round(100 * float((d[ok] > 0.1).mean()), 1) if ok.any() else None,
+            "loss_pct": round(100 * float((d[ok] < -0.1).mean()), 1) if ok.any() else None,
+            "usable_pct": round(100 * float(ok.mean()), 1), "diff": d, "bounds": bounds,
+            "diff_rgba": colorize_diff(d), "before_rgba": colorize(v1), "after_rgba": colorize(v2),
+            "seconds": round(time.perf_counter() - t, 1), "pixels": int(d.size)}

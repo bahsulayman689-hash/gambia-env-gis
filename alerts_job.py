@@ -6,6 +6,8 @@ Env vars: TWILIO_SID, TWILIO_TOKEN, TWILIO_FROM, ALERT_RECIPIENTS (comma-separat
 If no sender is configured the alerts are only printed.
 """
 import os
+import time
+
 import requests
 
 TOWNS = [("Banjul", 13.4549, -16.5790, 5), ("Serrekunda", 13.4383, -16.6781, 5), ("Bakau", 13.4781, -16.6819, 4),
@@ -19,10 +21,20 @@ ORG = os.getenv("ORG_NAME", "Gambia Environmental Monitor")
 
 
 def get(url, params):
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    j = r.json()
-    return j if isinstance(j, list) else [j]
+    for attempt in range(4):
+        try:
+            r = requests.get(url, params=params, timeout=30)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            if attempt < 3:
+                time.sleep(1.5 * 2 ** attempt)
+                continue
+            raise
+        if r.status_code in (429, 500, 502, 503, 504) and attempt < 3:
+            time.sleep(1.5 * 2 ** attempt)
+            continue
+        r.raise_for_status()
+        j = r.json()
+        return j if isinstance(j, list) else [j]
 
 
 def main():

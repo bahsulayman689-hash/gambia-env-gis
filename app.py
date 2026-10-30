@@ -15,13 +15,14 @@ from pathlib import Path
 
 import branca.colormap as cm
 import folium
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as pgo
 from plotly.subplots import make_subplots
 import requests
 import streamlit as st
-from folium.plugins import Fullscreen, HeatMap, MiniMap
+from folium.plugins import Draw, Fullscreen, HeatMap, MiniMap
 from streamlit_folium import st_folium
 
 st.set_page_config(page_title="Gambia Environmental GIS", page_icon="🌍", layout="wide")
@@ -137,10 +138,39 @@ TOWNS = {t[0]: dict(region=t[1], lat=t[2], lon=t[3], exp=t[4], issues=t[5]) for 
 LEVEL_COLORS = {"Low": "#2ecc71", "Watch": "#f1c40f", "Warning": "#e67e22", "Severe": "#c0392b"}
 
 
-def get(url, params):
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
+_CUSTOMER = {"https://api.open-meteo.com": "https://customer-api.open-meteo.com",
+             "https://air-quality-api.open-meteo.com": "https://customer-air-quality-api.open-meteo.com",
+             "https://archive-api.open-meteo.com": "https://customer-archive-api.open-meteo.com",
+             "https://marine-api.open-meteo.com": "https://customer-marine-api.open-meteo.com",
+             "https://flood-api.open-meteo.com": "https://customer-flood-api.open-meteo.com"}
+
+
+def get(url, params, timeout=30):
+    """GET JSON with retries on timeouts and temporary errors (429, 5xx). Uses the Open-Meteo
+    commercial endpoints when OPEN_METEO_KEY is set in secrets."""
+    key = None
+    try:
+        key = st.secrets["OPEN_METEO_KEY"]
+    except Exception:
+        pass
+    if key:
+        for free, cust in _CUSTOMER.items():
+            if url.startswith(free):
+                url, params = url.replace(free, cust, 1), {**params, "apikey": key}
+                break
+    for attempt in range(4):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            if attempt < 3:
+                time.sleep(1.5 * 2 ** attempt)
+                continue
+            raise
+        if r.status_code in (429, 500, 502, 503, 504) and attempt < 3:
+            time.sleep(1.5 * 2 ** attempt)   # 1.5 s, 3 s, 6 s
+            continue
+        r.raise_for_status()
+        return r.json()
 
 
 # ---------------------------------------------------------------- data loaders
@@ -357,6 +387,206 @@ def s2_stats(fid, bbox, max_px, _feature):
 def s2_scene(fid, bbox, max_px, _feature):
     import sentinel
     return sentinel.load_scene(_feature, list(bbox), max_px)
+
+
+FIRMS_BBOX = "-16.9,13.0,-13.7,13.9"
+CONF_MAP = {"l": "Low", "n": "Nominal", "h": "High"}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_firms_source(key, source, days):
+    url = f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/{key}/{source}/{FIRMS_BBOX}/{days}"
+    r = requests.get(url, timeout=40)
+    r.raise_for_status()
+    f = pd.read_csv(io.StringIO(r.text))
+    if "latitude" not in f.columns:
+        raise ValueError(r.text[:120])
+    return f
+
+
+def hav_km(la1, lo1, la2, lo2):
+    la1, lo1, la2, lo2 = map(np.radians, (la1, lo1, la2, lo2))
+    a = np.sin((la2 - la1) / 2) ** 2 + np.cos(la1) * np.cos(la2) * np.sin((lo2 - lo1) / 2) ** 2
+    return 2 * 6371 * np.arcsin(np.sqrt(a))
+
+
+def match_rate(a, b, km):
+    """Share of detections in `a` that have a detection in `b` within `km` on the same date."""
+    if a is None or b is None or not len(a):
+        return None
+    hits = 0
+    for d, ga in a.groupby("acq_date"):
+        gb = b[b["acq_date"] == d]
+        if gb.empty:
+            continue
+        dist = hav_km(ga["latitude"].values[:, None], ga["longitude"].values[:, None],
+                      gb["latitude"].values[None, :], gb["longitude"].values[None, :])
+        hits += int((dist.min(axis=1) <= km).sum())
+    return round(100 * hits / len(a), 1)
+
+
+@st.cache_data(ttl=600, show_spinner="Checking data sources…")
+def health_checks(key):
+    rows = []
+
+    def add(src, check, t0, ok, fresh="-", note=""):
+        rows.append({"Source": src, "Check": check, "Status": "Up" if ok else "Down",
+                     "Latency (ms)": int((time.perf_counter() - t0) * 1000), "Freshness": fresh, "Note": note})
+
+    t0 = time.perf_counter()
+    try:
+        r = requests.get(FORECAST, params={"latitude": 13.45, "longitude": -16.58, "current": "temperature_2m",
+                                           "timezone": "UTC"}, timeout=20)
+        note = ""
+        if r.ok:
+            age = (pd.Timestamp.now("UTC").tz_localize(None) - pd.to_datetime(r.json()["current"]["time"])).total_seconds() / 60
+            note = f"Latest reading {age:.0f} min old"
+        add("Open-Meteo", "Weather API", t0, r.ok, note=note)
+    except Exception as e:
+        add("Open-Meteo", "Weather API", t0, False, note=str(e)[:60])
+    t0 = time.perf_counter()
+    try:
+        r = requests.get("https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/MODIS_Terra_NDVI_8Day/default/default/"
+                         "GoogleMapsCompatible_Level9/2/1/1.png", timeout=20)
+        add("NASA GIBS", "NDVI map tile", t0, r.ok and len(r.content) > 0, note=f"{len(r.content)} bytes")
+    except Exception as e:
+        add("NASA GIBS", "NDVI map tile", t0, False, note=str(e)[:60])
+    t0 = time.perf_counter()
+    try:
+        r = requests.get("https://earth-search.aws.element84.com/v1", timeout=20)
+        add("Earth Search (Sentinel-2)", "STAC API", t0, r.ok)
+    except Exception as e:
+        add("Earth Search (Sentinel-2)", "STAC API", t0, False, note=str(e)[:60])
+    if key:
+        t0 = time.perf_counter()
+        try:
+            r = requests.get(f"https://firms.modaps.eosdis.nasa.gov/api/data_availability/csv/{key}/ALL", timeout=20)
+            r.raise_for_status()
+            av = pd.read_csv(io.StringIO(r.text))
+            mcol = [c for c in av.columns if "max" in c.lower()][0]
+            for sensor in ("VIIRS_SNPP_NRT", "VIIRS_NOAA20_NRT", "MODIS_NRT"):
+                sel = av[av.iloc[:, 0] == sensor]
+                if len(sel):
+                    mx = pd.to_datetime(sel.iloc[0][mcol])
+                    age = (pd.Timestamp.now("UTC").tz_localize(None).normalize() - mx.normalize()).days
+                    fr = "Fresh" if age <= 1 else "Delayed" if age <= 3 else "Stale"
+                    add("NASA FIRMS", sensor, t0, True, fresh=fr, note=f"Newest data {mx.date()} ({age} day(s) old)")
+        except Exception as e:
+            add("NASA FIRMS", "Data availability", t0, False, note=str(e)[:60])
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=60)
+def load_dq_log(token):
+    rows = sb_rest("GET", "data_quality_log", token, {"select": "*", "order": "created_at.desc", "limit": "500"})
+    return pd.DataFrame(rows or [])
+
+
+CROPS = ["Groundnut", "Rice", "Millet", "Maize", "Sorghum", "Cowpea", "Cassava", "Vegetables", "Other"]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def geocode(name):
+    j = requests.get("https://geocoding-api.open-meteo.com/v1/search",
+                     params={"name": name, "count": 10, "language": "en", "format": "json"}, timeout=20).json()
+    res = [r for r in j.get("results", []) if r.get("country_code") == "GM"] or j.get("results", [])
+    return [{"label": f"{r['name']}, {r.get('admin1', '')}, {r.get('country_code', '')}", "lat": r["latitude"],
+             "lon": r["longitude"]} for r in res]
+
+
+def square_geom(lat, lon, ha):
+    half = (ha * 10000) ** 0.5 / 2
+    dlat, dlon = half / 110540, half / (111320 * float(np.cos(np.radians(lat))))
+    return {"type": "Polygon", "coordinates": [[[lon - dlon, lat - dlat], [lon + dlon, lat - dlat], [lon + dlon, lat + dlat],
+                                                [lon - dlon, lat + dlat], [lon - dlon, lat - dlat]]]}
+
+
+def geom_info(g):
+    ring = g["coordinates"][0]
+    lat0 = sum(c[1] for c in ring) / len(ring)
+    lon0 = sum(c[0] for c in ring) / len(ring)
+    pts = [((c[0] - lon0) * 111320 * float(np.cos(np.radians(lat0))), (c[1] - lat0) * 110540) for c in ring]
+    area = abs(sum(pts[i][0] * pts[i + 1][1] - pts[i + 1][0] * pts[i][1] for i in range(len(pts) - 1))) / 2 / 10000
+    return lat0, lon0, area
+
+
+@st.cache_data(ttl=1800, show_spinner="Loading farm weather…")
+def load_farm_weather(lat, lon, past_days):
+    j = get(FORECAST, {"latitude": round(lat, 4), "longitude": round(lon, 4), "past_days": past_days, "forecast_days": 7,
+                       "timezone": "Africa/Banjul", "daily": "precipitation_sum,temperature_2m_max,et0_fao_evapotranspiration",
+                       "hourly": "soil_moisture_0_to_7cm"})
+    d = pd.DataFrame(j["daily"])
+    d["time"] = pd.to_datetime(d["time"])
+    h = pd.DataFrame(j["hourly"])
+    h["time"] = pd.to_datetime(h["time"])
+    sm = h.set_index("time")["soil_moisture_0_to_7cm"].resample("D").mean().reset_index()
+    return d.merge(sm, on="time", how="left")
+
+
+@st.cache_data(ttl=86400, show_spinner=False, max_entries=300)
+def farm_ndvi(fid, geom_json, _feature):
+    import sentinel
+    return sentinel.field_ndvi(_feature, json.loads(geom_json))
+
+
+@st.cache_data(ttl=60)
+def load_farms(token):
+    rows = sb_rest("GET", "farms", token, {"select": "*", "order": "created_at.desc", "limit": "100"})
+    return pd.DataFrame(rows or [])
+
+
+NDVI_LABEL = "Vegetation greenness (NDVI, Sentinel-2)"
+METRICS_TS = {  # name: (archive variable, monthly aggregation, hourly?)
+    "Rainfall (mm per month)": ("precipitation_sum", "sum", False),
+    "Average daily max temperature (°C)": ("temperature_2m_max", "mean", False),
+    "Average daily min temperature (°C)": ("temperature_2m_min", "mean", False),
+    "Soil moisture, top 7 cm (m³/m³)": ("soil_moisture_0_to_7cm", "mean", True),
+    "Evapotranspiration (mm per month)": ("et0_fao_evapotranspiration", "sum", False),
+    "Average maximum wind (km/h)": ("wind_speed_10m_max", "mean", False)}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _archive_chunk(lat, lon, start, end, var, hourly):
+    p = {"latitude": lat, "longitude": lon, "start_date": start, "end_date": end, "timezone": "Africa/Banjul",
+         ("hourly" if hourly else "daily"): var}
+    blk = get(ARCHIVE, p, timeout=90)["hourly" if hourly else "daily"]
+    return pd.Series(blk[var], index=pd.to_datetime(blk["time"]), dtype="float64")
+
+
+def load_monthly(lat, lon, start, end, metric):
+    """Monthly values from the Open-Meteo archive, fetched one calendar year at a time so each
+    piece is small and saved separately (a failed year does not lose the others)."""
+    var, how, hourly = METRICS_TS[metric]
+    cur, last, parts = date.fromisoformat(start), date.fromisoformat(end), []
+    while cur <= last:
+        nxt = min(date(cur.year, 12, 31), last)
+        parts.append(_archive_chunk(round(lat, 3), round(lon, 3), str(cur), str(nxt), var, hourly))
+        cur = nxt + timedelta(days=1)
+    ser = pd.concat(parts)
+    if hourly:
+        ser = ser.resample("D").mean()
+    m = (ser.resample("MS").sum(min_count=1) if how == "sum" else ser.resample("MS").mean()).reset_index()
+    m.columns = ["month", "value"]
+    return m
+
+
+def block_change(d, how):
+    """Latest 12 months vs the average of earlier 12-month blocks."""
+    d = d.dropna().sort_values("month").reset_index(drop=True)
+    n = len(d) // 12
+    if n < 2:
+        return None
+    d = d.iloc[len(d) - n * 12:]
+    vals = [(d.iloc[i * 12:(i + 1) * 12]["value"].sum() if how == "sum" else d.iloc[i * 12:(i + 1) * 12]["value"].mean())
+            for i in range(n)]
+    prev = float(np.mean(vals[:-1]))
+    return vals[-1], prev, (100 * (vals[-1] - prev) / prev if prev else None)
+
+
+@st.cache_data(ttl=86400, show_spinner="Comparing the two scenes…", max_entries=8)
+def s2_change(id1, id2, bbox, max_px, _f1, _f2):
+    import sentinel
+    return sentinel.change(_f1, _f2, list(bbox), max_px)
 
 
 def secret(k):
@@ -618,6 +848,13 @@ if SB_ON and TOKEN:
     except Exception as e:
         inc_err = str(e)
 
+farms = None
+if SB_ON and TOKEN:
+    try:
+        farms = load_farms(TOKEN)
+    except Exception:
+        farms = None
+
 # ---------------------------------------------------------------- header / KPIs
 def _logo():
     try:
@@ -759,7 +996,7 @@ if firms_key:
     except Exception as e:
         st.warning(f"FIRMS unavailable: {e}")
 
-tab_map, tab_flood, tab_land, tab_an, tab_s2, tab_inc, tab_clim, tab_data = st.tabs(["🗺️ Map", "🌊 Flooding & town issues", "🌾 Drought & coast", "📊 Analysis", "🛰️ Sentinel-2", "📝 Incident reports", "📈 Climate history", "📋 Data & export"])
+tab_map, tab_flood, tab_land, tab_an, tab_cmp, tab_s2, tab_farm, tab_dq, tab_inc, tab_clim, tab_data = st.tabs(["🗺️ Map", "🌊 Flooding & town issues", "🌾 Drought & coast", "📊 Analysis", "🕒 Compare over time", "🛰️ Sentinel-2", "🌱 Farm monitor", "🧪 Data quality", "📝 Incident reports", "📈 Climate history", "📋 Data & export"])
 
 # ---------------------------------------------------------------- map
 with tab_map:
@@ -813,6 +1050,16 @@ with tab_map:
                                 popup=folium.Popup(pop, max_width=280),
                                 tooltip=f"{r.get('type', '')}: {r.get('severity', '')}").add_to(ig)
         ig.add_to(m)
+
+    if farms is not None and len(farms) and "geojson" in farms.columns:
+        fg2 = folium.FeatureGroup(name="My farms")
+        for _, r in farms.iterrows():
+            try:
+                folium.GeoJson(json.loads(r["geojson"]), tooltip=f"{r['name']} ({r['crop']})",
+                               style_function=lambda _x: {"color": "#1F8A5B", "weight": 3, "fillOpacity": 0.25}).add_to(fg2)
+            except Exception:
+                pass
+        fg2.add_to(m)
 
     G = "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best"
     if show_ndvi:
@@ -1053,6 +1300,168 @@ with tab_an:
     else:
         st.info("Incident analysis appears here once reports are submitted (sign-in and Supabase required).")
 
+# ---------------------------------------------------------------- compare over time
+with tab_cmp:
+    opts = {n: (t["lat"], t["lon"]) for n, t in TOWNS.items()}
+    if farms is not None and len(farms):
+        for _, r in farms.iterrows():
+            opts[f"Farm: {r['name']}"] = (float(r["lat"]), float(r["lon"]))
+    with st.expander("Add a custom point (optional)"):
+        cn = st.text_input("Name", "My point", key="cmp_cn")
+        cla = st.number_input("Latitude", value=13.45, format="%.4f", key="cmp_cla")
+        clo = st.number_input("Longitude", value=-15.4, format="%.4f", key="cmp_clo")
+        if st.checkbox("Include this point", key="cmp_cinc"):
+            opts[cn] = (cla, clo)
+
+    st.subheader("1. Compare places over time")
+    m1, m2, m3 = st.columns([2, 1.5, 1])
+    sel = m1.multiselect("Places (up to 4)", list(opts), default=["Banjul", "Basse"], key="cmp_sel")
+    metric = m2.selectbox("What to compare", list(METRICS_TS) + [NDVI_LABEL], key="cmp_metric")
+    yrs = m3.select_slider("Years back", [1, 2, 3, 5, 10], value=5, key="cmp_yrs")
+    first_this = date.today().replace(day=1)
+    end_d = first_this - timedelta(days=1)
+    start_d = date(first_this.year - yrs, first_this.month, 1)
+
+    if metric == NDVI_LABEL:
+        st.caption("Reads a 1 km square around each place from up to 10 Sentinel-2 scenes (cloud under 40%). "
+                   "This is slower, and the rainy season (about June to October) often has no clear scenes.")
+        if sel and st.button("Load NDVI for these places", type="primary"):
+            frames = []
+            with st.spinner("Reading satellite scenes…"):
+                for nm in sel[:3]:
+                    la_, lo_ = opts[nm]
+                    gj = json.dumps(square_geom(la_, lo_, 100.0), sort_keys=True)
+                    try:
+                        _, fs = s2_search(la_, lo_, 0.6, str(start_d), str(end_d), 40)
+                    except Exception:
+                        fs = []
+                    for f_ in fs[::max(1, len(fs) // 10)][:10]:
+                        try:
+                            frames.append({**farm_ndvi(f_["id"], gj, f_), "Place": nm})
+                        except Exception:
+                            pass
+            st.session_state["cmp_ndvi"] = pd.DataFrame(frames)
+        nd = st.session_state.get("cmp_ndvi")
+        if nd is not None and len(nd):
+            nd = nd[nd["mean_ndvi"].notna() & (nd["valid_pct"] >= 30)].sort_values("date")
+            st.plotly_chart(px.line(nd, x="date", y="mean_ndvi", color="Place", markers=True,
+                                    title="Greenness over time (mean NDVI, clear pixels)", labels={"mean_ndvi": "NDVI", "date": ""}),
+                            use_container_width=True)
+        elif nd is not None:
+            st.warning("No clear scenes found for these places and dates.")
+    else:
+        mode = st.radio("View", ["Places side by side", "One place, year over year", "One place, difference from normal"],
+                        horizontal=True, key="cmp_mode")
+        smooth = st.checkbox("Smooth with a 3-month average", key="cmp_smooth")
+        how = METRICS_TS[metric][1]
+        series = {}
+        for nm in sel[:4]:
+            try:
+                series[nm] = load_monthly(opts[nm][0], opts[nm][1], str(start_d), str(end_d), metric)
+            except Exception as e:
+                st.warning(f"{nm}: could not load ({e})")
+        if series:
+            if mode == "Places side by side":
+                allm = pd.concat([d_.assign(Place=n_) for n_, d_ in series.items()])
+                if smooth:
+                    allm["value"] = allm.groupby("Place")["value"].transform(lambda x: x.rolling(3, center=True, min_periods=1).mean())
+                st.plotly_chart(px.line(allm, x="month", y="value", color="Place", markers=True, title=metric,
+                                        labels={"value": metric, "month": ""}), use_container_width=True)
+                rows_ = []
+                for n_, d_ in series.items():
+                    bc = block_change(d_, how)
+                    row = {"Place": n_, "Latest 12 months": None, "Earlier years (average)": None, "Change (%)": None, "Trend per decade": None}
+                    if bc:
+                        row.update({"Latest 12 months": round(bc[0], 2), "Earlier years (average)": round(bc[1], 2),
+                                    "Change (%)": None if bc[2] is None else round(bc[2], 1)})
+                    dd = d_.dropna()
+                    if how == "mean" and len(dd) >= 60:
+                        yrs_ = dd["month"].dt.year + (dd["month"].dt.month - 1) / 12
+                        row["Trend per decade"] = round(float(np.polyfit(yrs_, dd["value"], 1)[0] * 10), 2)
+                    rows_.append(row)
+                st.dataframe(pd.DataFrame(rows_), hide_index=True, use_container_width=True)
+                st.caption("Latest 12 months vs the average of earlier 12-month periods (totals for rain and evapotranspiration, "
+                           "averages for the rest). Trend per decade needs 5+ years and is only a rough guide: natural year-to-year "
+                           "variation is large in The Gambia, so a short record can mislead.")
+            else:
+                nm1 = next(iter(series))
+                d1 = series[nm1].dropna().copy()
+                d1["Year"] = d1["month"].dt.year.astype(str)
+                d1["Month"] = d1["month"].dt.month
+                if mode == "One place, year over year":
+                    st.plotly_chart(px.line(d1, x="Month", y="value", color="Year", markers=True,
+                                            title=f"{nm1}: {metric}, each year", labels={"value": metric}), use_container_width=True)
+                else:
+                    clim = d1.groupby("Month")["value"].transform("mean")
+                    d1["Difference from normal"] = d1["value"] - clim
+                    d1["Direction"] = np.where(d1["Difference from normal"] >= 0, "Above normal", "Below normal")
+                    st.plotly_chart(px.bar(d1, x="month", y="Difference from normal", color="Direction",
+                                           color_discrete_map={"Above normal": "#1C6DD0", "Below normal": "#C8372D"},
+                                           title=f"{nm1}: {metric}, difference from the {yrs}-year average for that month",
+                                           labels={"month": ""}), use_container_width=True)
+                st.caption("The first selected place is shown. Normal = the average for that calendar month over the period chosen.")
+        elif sel:
+            st.info("No data could be loaded. Try again in a minute.")
+
+    st.subheader("2. See how one place changed between two dates (Sentinel-2)")
+    try:
+        import sentinel  # noqa: F401
+        s2c = True
+    except Exception as e:
+        s2c = False
+        st.info(f"Needs the rasterio package. Details: {e}")
+    if s2c:
+        b1, b2, b3 = st.columns([1.3, 1, 1])
+        place = b1.selectbox("Place", list(opts), key="chg_place")
+        halfc = b2.select_slider("Area half-width (km)", [1, 2, 5, 10], value=2, key="chg_half")
+        cloudc = b3.slider("Max scene cloud (%)", 5, 80, 30, key="chg_cloud")
+        d1_, d2_ = st.columns(2)
+        before = d1_.date_input("Before (date range)", value=(date.today() - timedelta(days=425), date.today() - timedelta(days=365)), key="chg_before")
+        after = d2_.date_input("After (date range)", value=(date.today() - timedelta(days=60), date.today()), key="chg_after")
+        st.caption("Compare the same season in different years (for example dry season to dry season), "
+                   "or the vegetation will differ just because of the time of year.")
+        if st.button("Compare these two periods", type="primary"):
+            if len(before) != 2 or len(after) != 2:
+                st.warning("Pick a start and an end date for both ranges.")
+            else:
+                la_, lo_ = opts[place]
+                try:
+                    bb, fb = s2_search(la_, lo_, halfc, str(before[0]), str(before[1]), cloudc)
+                    _, fa = s2_search(la_, lo_, halfc, str(after[0]), str(after[1]), cloudc)
+                    if not fb or not fa:
+                        st.warning("No clear scene in " + ("the before period." if not fb else "the after period.") +
+                                   " Widen the dates or raise the cloud limit.")
+                    else:
+                        f1 = min(fb, key=lambda f: f["properties"].get("eo:cloud_cover", 100))
+                        f2 = min(fa, key=lambda f: f["properties"].get("eo:cloud_cover", 100))
+                        st.session_state["chg_res"] = (place, s2_change(f1["id"], f2["id"], tuple(round(x, 4) for x in bb), 500, f1, f2))
+                except Exception as e:
+                    st.error(f"Could not compare: {e}")
+        cr = st.session_state.get("chg_res")
+        if cr and cr[0] == place:
+            r = cr[1]
+            k = st.columns(5)
+            k[0].metric("Before", r["before_date"], f"{r['before_cloud']:.0f}% cloud" if r["before_cloud"] is not None else None, delta_color="off")
+            k[1].metric("After", r["after_date"], f"{r['after_cloud']:.0f}% cloud" if r["after_cloud"] is not None else None, delta_color="off")
+            k[2].metric("Mean NDVI change", r["mean_change"] if r["mean_change"] is not None else "n/a",
+                        f"{r['mean_before']} to {r['mean_after']}", delta_color="off")
+            k[3].metric("Greener area", f"{r['gain_pct']}%" if r["gain_pct"] is not None else "n/a", help="Share of clear pixels where NDVI rose by more than 0.1")
+            k[4].metric("Browner area", f"{r['loss_pct']}%" if r["loss_pct"] is not None else "n/a", help="Share of clear pixels where NDVI fell by more than 0.1")
+            la_, lo_ = opts[place]
+            mc = folium.Map(location=[la_, lo_], zoom_start={1: 13, 2: 12, 5: 11, 10: 10}[halfc], tiles="CartoDB positron")
+            folium.raster_layers.ImageOverlay(image=r["diff_rgba"], bounds=r["bounds"], opacity=0.9, name="Change (after minus before)").add_to(mc)
+            folium.raster_layers.ImageOverlay(image=r["before_rgba"], bounds=r["bounds"], opacity=0.85, name="Before NDVI", show=False).add_to(mc)
+            folium.raster_layers.ImageOverlay(image=r["after_rgba"], bounds=r["bounds"], opacity=0.85, name="After NDVI", show=False).add_to(mc)
+            folium.LayerControl(collapsed=False).add_to(mc)
+            st_folium(mc, height=480, use_container_width=True, returned_objects=[], key="chg_map")
+            st.caption("Green = vegetation increased, red = decreased, near white = little change. Transparent = cloud or no data. "
+                       "Differences can also come from haze, sun angle, harvest, burning or flooding, so check on the ground. "
+                       f"Read in {r['seconds']} s.")
+            dv = r["diff"][~pd.isna(r["diff"])]
+            if len(dv):
+                st.plotly_chart(px.histogram(x=dv.ravel(), nbins=40, title="Distribution of NDVI change (after minus before)",
+                                             labels={"x": "NDVI change"}), use_container_width=True)
+
 # ---------------------------------------------------------------- sentinel-2
 with tab_s2:
     try:
@@ -1132,6 +1541,323 @@ with tab_s2:
                 st.dataframe(tr[["date", "mean_ndvi", "veg_pct", "cloud_pct", "usable_pct", "seconds"]], hide_index=True, use_container_width=True)
         st.caption("Source: Copernicus Sentinel-2 L2A via Earth Search (Element 84, AWS), free with no key. "
                    "Typically clearest from about November to May, but vegetation is also drier then. Verify the licence for commercial use.")
+
+# ---------------------------------------------------------------- farm monitor
+with tab_farm:
+    st.subheader("1. Locate your farm")
+    ctr = st.session_state.get("farm_center", (13.45, -15.4, 8))
+    c1, c2 = st.columns([1, 1.7], gap="large")
+    with c1:
+        q = st.text_input("Search a village or town", key="farm_q", placeholder="e.g. Basse, Farafenni, Brikama")
+        if q:
+            try:
+                hits = geocode(q)
+            except Exception:
+                hits = []
+            if hits:
+                hi = st.selectbox("Matches", range(len(hits)), format_func=lambda k: hits[k]["label"], key="farm_hit")
+                if st.button("Go to this place"):
+                    st.session_state["farm_center"] = (hits[hi]["lat"], hits[hi]["lon"], 14)
+                    st.rerun()
+            else:
+                st.caption("No match. Try another spelling or enter coordinates.")
+        la = st.number_input("Latitude", value=float(ctr[0]), format="%.5f", key=f"fl_{ctr[0]:.5f}")
+        lo = st.number_input("Longitude", value=float(ctr[1]), format="%.5f", key=f"fo_{ctr[1]:.5f}")
+        if st.button("Go to coordinates"):
+            st.session_state["farm_center"] = (la, lo, 15)
+            st.rerun()
+        if st.session_state.get("picked") and st.button("Use the point clicked on the main map"):
+            pk = st.session_state["picked"]
+            st.session_state["farm_center"] = (pk[0], pk[1], 15)
+            st.rerun()
+        ha_m = st.number_input("Field size if you drop a marker (hectares)", 0.1, 100.0, 1.0)
+        saved_choice = None
+        if farms is not None and len(farms):
+            names = ["(none)"] + [f"{r['name']} ({r['crop']})" for _, r in farms.iterrows()]
+            k_ = st.selectbox("Or open a saved farm", range(len(names)), format_func=lambda i: names[i])
+            saved_choice = None if k_ == 0 else farms.iloc[k_ - 1]
+        st.caption("On the map, outline the field with the polygon or rectangle tool, or drop a marker. "
+                   "Switch to Satellite photo (top right) to see field boundaries.")
+    with c2:
+        mf = folium.Map(location=[ctr[0], ctr[1]], zoom_start=ctr[2], tiles=None)
+        folium.TileLayer("OpenStreetMap", name="Street map").add_to(mf)
+        folium.TileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                         attr="Esri World Imagery", name="Satellite photo", max_zoom=19).add_to(mf)
+        Draw(export=False, edit_options={"edit": False},
+             draw_options={"polyline": False, "circle": False, "circlemarker": False, "polygon": True,
+                           "rectangle": True, "marker": True}).add_to(mf)
+        if farms is not None and len(farms) and "geojson" in farms.columns:
+            for _, r in farms.iterrows():
+                try:
+                    folium.GeoJson(json.loads(r["geojson"]), tooltip=r["name"],
+                                   style_function=lambda _x: {"color": "#1F8A5B", "weight": 3}).add_to(mf)
+                except Exception:
+                    pass
+        folium.LayerControl().add_to(mf)
+        fo_ = st_folium(mf, height=470, use_container_width=True, returned_objects=["last_active_drawing"], key="farm_map")
+        dr_ = (fo_ or {}).get("last_active_drawing")
+        if dr_ and dr_.get("geometry"):
+            st.session_state["farm_draw"] = dr_["geometry"]
+
+    active = None
+    if saved_choice is not None:
+        gg = json.loads(saved_choice["geojson"])
+        active = {"name": saved_choice["name"], "crop": saved_choice["crop"], "geom": gg, "id": saved_choice["id"],
+                  "planted": pd.to_datetime(saved_choice["planting_date"]).date() if saved_choice.get("planting_date") else date.today() - timedelta(days=30)}
+    elif st.session_state.get("farm_draw"):
+        g0 = st.session_state["farm_draw"]
+        if g0["type"] == "Point":
+            gg = square_geom(g0["coordinates"][1], g0["coordinates"][0], ha_m)
+        elif g0["type"] == "Polygon":
+            gg = g0
+        else:
+            gg = None
+        if gg:
+            f1, f2, f3 = st.columns(3)
+            nm = f1.text_input("Farm name", "My farm", key="farm_name")
+            cr = f2.selectbox("Crop", CROPS, key="farm_crop")
+            pl = f3.date_input("Planting date", value=date.today() - timedelta(days=30), key="farm_plant")
+            active = {"name": nm, "crop": cr, "geom": gg, "id": None, "planted": pl}
+    if active is None:
+        st.info("Draw your field or drop a marker on the map (or open a saved farm) to start monitoring.")
+    else:
+        flat, flon, fha = geom_info(active["geom"])
+        gjson = json.dumps(active["geom"], sort_keys=True)
+        sv1, sv2 = st.columns([1, 3])
+        if SB_ON and TOKEN:
+            if active["id"] is None and sv1.button("Save this farm", type="primary"):
+                try:
+                    sb_rest("POST", "farms", TOKEN, body={"name": active["name"], "crop": active["crop"],
+                            "planting_date": str(active["planted"]), "lat": flat, "lon": flon, "area_ha": round(fha, 2),
+                            "geojson": gjson})
+                    load_farms.clear()
+                    st.success("Saved. It now shows on the main map and in the saved farms list.")
+                except ValueError as e:
+                    st.error(f"Could not save: {e}. Run the farms SQL from the README.")
+            if active["id"] is not None and sv1.button("Delete this farm"):
+                try:
+                    sb_rest("DELETE", "farms", TOKEN, params={"id": f"eq.{active['id']}"})
+                    load_farms.clear()
+                    st.rerun()
+                except ValueError as e:
+                    st.error(str(e))
+        else:
+            sv2.caption("Sign in (with Supabase set up) to save farms. Unsaved farms last for this session only.")
+
+        st.subheader(f"2. Monitoring: {active['name']} ({active['crop']})")
+        days_since = max((date.today() - active["planted"]).days, 0)
+        try:
+            fw = load_farm_weather(flat, flon, int(min(max(days_since + 3, 14), 90)))
+            today_ts = pd.Timestamp(date.today())
+            past = fw[fw["time"] < today_ts]
+            since = past[past["time"] >= pd.Timestamp(active["planted"])]
+            dry = 0
+            for v in reversed([x or 0 for x in past["precipitation_sum"].tolist()]):
+                if v >= 1:
+                    break
+                dry += 1
+            sm_now = fw.loc[fw["time"] == today_ts, "soil_moisture_0_to_7cm"]
+            sm_now = float(sm_now.iloc[0]) if len(sm_now) and pd.notna(sm_now.iloc[0]) else None
+            nxt = fw[(fw["time"] >= today_ts) & (fw["time"] < today_ts + pd.Timedelta(days=3))]
+            k = st.columns(6)
+            k[0].metric("Field area", f"{fha:.1f} ha")
+            k[1].metric("Days since planting", days_since)
+            k[2].metric("Rain since planting", f"{since['precipitation_sum'].fillna(0).sum():.0f} mm")
+            k[3].metric("Days without rain", dry)
+            k[4].metric("Soil moisture", f"{sm_now:.2f}" if sm_now is not None else "n/a", help="Top 7 cm, m³/m³ (model)")
+            k[5].metric("Max temp, next 3 days", f"{nxt['temperature_2m_max'].max():.0f}°C")
+            fig = make_subplots(specs=[[{"secondary_y": True}]])
+            fig.add_trace(pgo.Bar(x=fw["time"], y=fw["precipitation_sum"], name="Rain (mm)",
+                                  marker_color=["#9db7d5" if t < today_ts else "#1C6DD0" for t in fw["time"]]), secondary_y=False)
+            fig.add_trace(pgo.Scatter(x=fw["time"], y=fw["soil_moisture_0_to_7cm"], name="Soil moisture", line=dict(color="#1F8A5B")), secondary_y=True)
+            fig.update_yaxes(title_text="Rain (mm)", secondary_y=False)
+            fig.update_yaxes(title_text="Soil moisture (m³/m³)", secondary_y=True)
+            fig.update_layout(title="Rain and soil moisture (pale bars = past, solid = forecast)")
+            st.plotly_chart(fig, use_container_width=True)
+            weather_ok = True
+        except Exception as e:
+            weather_ok = False
+            st.warning(f"Weather unavailable: {e}")
+
+        st.markdown("##### Crop greenness from Sentinel-2 (inside your field only)")
+        try:
+            import sentinel  # noqa: F401
+            s2f = True
+        except Exception as e:
+            s2f = False
+            st.info(f"Needs the rasterio package. Details: {e}")
+        trend = None
+        if s2f:
+            fcloud = st.slider("Max scene cloud cover (%)", 10, 80, 40, key="farm_cloud")
+            try:
+                start_ = max(active["planted"] - timedelta(days=14), date.today() - timedelta(days=365))
+                _, fscenes = s2_search(flat, flon, 0.5, str(start_), str(date.today()), fcloud)
+            except Exception as e:
+                fscenes = []
+                st.error(f"Scene search failed: {e}")
+            st.caption(f"{len(fscenes)} scene(s) since two weeks before planting. Sentinel-2 passes about every 5 days; "
+                       "cloud is common from about June to October.")
+            if fscenes and st.button("Compute field NDVI trend (up to 12 scenes)", type="primary"):
+                rows_ = []
+                with st.spinner("Reading your field from each scene…"):
+                    for fsc in fscenes[:12]:
+                        try:
+                            rows_.append(farm_ndvi(fsc["id"], gjson, fsc))
+                        except Exception:
+                            pass
+                st.session_state["farm_trend"] = (gjson, pd.DataFrame(rows_))
+            ft_ = st.session_state.get("farm_trend")
+            if ft_ and ft_[0] == gjson and len(ft_[1]):
+                trend = ft_[1]
+                trend = trend[trend["mean_ndvi"].notna() & (trend["valid_pct"] >= 30)].sort_values("date")
+                if len(trend):
+                    ftr = pgo.Figure()
+                    ftr.add_trace(pgo.Scatter(x=trend["date"], y=trend["p90"], line=dict(width=0), showlegend=False, hoverinfo="skip"))
+                    ftr.add_trace(pgo.Scatter(x=trend["date"], y=trend["p10"], fill="tonexty", line=dict(width=0),
+                                              fillcolor="rgba(31,138,91,.18)", name="Spread (10th to 90th percentile)"))
+                    ftr.add_trace(pgo.Scatter(x=trend["date"], y=trend["mean_ndvi"], mode="lines+markers", name="Mean NDVI",
+                                              line=dict(color="#1F8A5B")))
+                    ftr.update_layout(title="Field NDVI over time (clear pixels only)", yaxis_title="NDVI")
+                    st.plotly_chart(ftr, use_container_width=True)
+                    st.dataframe(trend[["date", "mean_ndvi", "p10", "p90", "valid_pct", "cloud_pct"]], hide_index=True,
+                                 use_container_width=True)
+                else:
+                    st.warning("No clear scenes with enough usable pixels over your field. Raise the cloud limit.")
+
+        st.markdown("##### Alerts for this field")
+        al = []
+        if weather_ok:
+            if dry >= 7:
+                al.append(f"No meaningful rain (under 1 mm) for {dry} days.")
+            if sm_now is not None and sm_now < 0.10:
+                al.append(f"Topsoil is dry (moisture {sm_now:.2f}).")
+            if nxt["temperature_2m_max"].max() >= T_HEAT:
+                al.append(f"Heat: up to {nxt['temperature_2m_max'].max():.0f}°C in the next 3 days.")
+            if nxt["precipitation_sum"].fillna(0).sum() >= 50:
+                al.append(f"Heavy rain forecast: {nxt['precipitation_sum'].fillna(0).sum():.0f} mm in 3 days (waterlogging or flood risk).")
+        if trend is not None and len(trend) >= 2:
+            d_ = float(trend["mean_ndvi"].iloc[-1] - trend["mean_ndvi"].iloc[-2])
+            if d_ <= -0.10:
+                al.append(f"Greenness fell by {abs(d_):.2f} NDVI between {trend['date'].iloc[-2]} and {trend['date'].iloc[-1]}. "
+                          "Possible stress, flooding, pests, harvest or cloud haze: check the field.")
+        if al:
+            for a_ in al:
+                st.warning(a_)
+        else:
+            st.success("No alerts right now (based on the data available).")
+        st.caption("Indicative thresholds only. NDVI depends on crop type and growth stage, so compare with earlier weeks and "
+                   "with neighbouring fields, and confirm problems on the ground. Satellite photo: Esri World Imagery.")
+
+# ---------------------------------------------------------------- data quality
+with tab_dq:
+    st.subheader("1. Are the data sources up and fresh?")
+    hc = health_checks(firms_key or "")
+    st.dataframe(hc, hide_index=True, use_container_width=True)
+    st.caption("Freshness: Fresh = newest data up to 1 day old, Delayed = up to 3 days, Stale = older. "
+               "FIRMS rows need your FIRMS key. Checked at most every 10 minutes.")
+
+    st.subheader("2. NASA FIRMS fire detections: do independent sensors agree?")
+    snap = {}
+    if not firms_key:
+        st.info("Add your FIRMS key (sidebar or secrets) to run the fire cross-checks.")
+    else:
+        dq_days = st.slider("Days to compare", 2, 10, 5, key="dq_days")
+        try:
+            snpp = load_firms_source(firms_key, "VIIRS_SNPP_NRT", dq_days)
+            n20 = load_firms_source(firms_key, "VIIRS_NOAA20_NRT", dq_days)
+            try:
+                modis = load_firms_source(firms_key, "MODIS_NRT", dq_days)
+            except Exception:
+                modis = None
+            a1, a2 = match_rate(snpp, n20, 2.0), match_rate(n20, snpp, 2.0)
+            a3 = match_rate(modis, pd.concat([snpp, n20]), 3.0) if modis is not None else None
+            k = st.columns(5)
+            k[0].metric("VIIRS SNPP detections", len(snpp))
+            k[1].metric("VIIRS NOAA-20 detections", len(n20))
+            k[2].metric("SNPP confirmed by NOAA-20", f"{a1}%" if a1 is not None else "n/a")
+            k[3].metric("NOAA-20 confirmed by SNPP", f"{a2}%" if a2 is not None else "n/a")
+            k[4].metric("MODIS confirmed by VIIRS", f"{a3}%" if a3 is not None else "n/a")
+            snap = {"snpp_to_noaa20_agreement_pct": a1, "noaa20_to_snpp_agreement_pct": a2, "modis_to_viirs_agreement_pct": a3}
+            c1, c2 = st.columns(2)
+            both = pd.concat([snpp.assign(Sensor="VIIRS SNPP"), n20.assign(Sensor="VIIRS NOAA-20")])
+            if len(both):
+                c1.plotly_chart(px.bar(both.groupby(["acq_date", "Sensor"]).size().reset_index(name="Detections"),
+                                       x="acq_date", y="Detections", color="Sensor", barmode="group",
+                                       title="Detections per day", labels={"acq_date": ""}), use_container_width=True)
+                conf = snpp["confidence"].astype(str).map(CONF_MAP).fillna("Other").value_counts().reset_index()
+                conf.columns = ["Confidence", "Detections"]
+                c2.plotly_chart(px.bar(conf, x="Confidence", y="Detections", title="VIIRS SNPP confidence classes"),
+                                use_container_width=True)
+            st.caption("Agreement = share of one sensor's detections with another sensor's detection within 2 km "
+                       "(3 km for MODIS) on the same date. Satellites pass at different times and fires can end between "
+                       "passes, so 100% is not expected. This checks consistency, not absolute accuracy.")
+        except Exception as e:
+            st.warning(f"FIRMS cross-check unavailable: {e}")
+
+    st.subheader("3. Checked against ground truth: fire incident reports")
+    if firms_key and inc is not None and len(inc) and "type" in inc.columns:
+        fr_ = inc[inc["type"] == "Fire"].copy()
+        fr_["when"] = pd.to_datetime(fr_["created_at"], utc=True).dt.tz_localize(None)
+        fr_ = fr_[fr_["when"] >= pd.Timestamp.now("UTC").tz_localize(None) - pd.Timedelta(days=10)]
+        if len(fr_):
+            try:
+                hot = pd.concat([load_firms_source(firms_key, "VIIRS_SNPP_NRT", 10), load_firms_source(firms_key, "VIIRS_NOAA20_NRT", 10)])
+                hot["d"] = pd.to_datetime(hot["acq_date"])
+                res_rows = []
+                for _, r in fr_.iterrows():
+                    near = hot[(hot["d"] - r["when"].normalize()).abs() <= pd.Timedelta(days=2)]
+                    dist = hav_km(r["lat"], r["lon"], near["latitude"].values, near["longitude"].values).min() if len(near) else None
+                    res_rows.append({"Date": str(r["when"].date()), "Town": r.get("town", ""),
+                                     "Nearest hotspot (km)": None if dist is None else round(float(dist), 1),
+                                     "Detected (within 5 km, 2 days)": bool(dist is not None and dist <= 5)})
+                rr = pd.DataFrame(res_rows)
+                det = int(rr["Detected (within 5 km, 2 days)"].sum())
+                st.metric("Reported fires seen by satellite", f"{det} of {len(rr)}", f"{100 * det / len(rr):.0f}%")
+                st.dataframe(rr, hide_index=True, use_container_width=True)
+                snap["fire_reports_detected_pct"] = round(100 * det / len(rr), 1)
+                if len(rr) < 10:
+                    st.caption("Fewer than 10 reports in the last 10 days: treat this percentage as indicative only.")
+            except Exception as e:
+                st.warning(f"Could not compare with reports: {e}")
+        else:
+            st.info("No fire incident reports in the last 10 days to compare against.")
+    else:
+        st.info("This check needs the FIRMS key and submitted incident reports of type Fire (sign-in and Supabase required).")
+    st.caption("Report dates use the time the report was submitted. Satellites can miss small, short or cloud-covered fires, "
+               "so a miss is not always a wrong report.")
+
+    st.subheader("4. Quality over time")
+    if SB_ON and TOKEN:
+        if st.button("Save a snapshot now"):
+            body = [{"source": "NASA FIRMS", "metric": m, "value": v, "note": ""} for m, v in snap.items() if v is not None]
+            body += [{"source": r["Source"], "metric": f"latency_ms:{r['Check']}", "value": float(r["Latency (ms)"]), "note": r["Status"]}
+                     for _, r in hc.iterrows()]
+            try:
+                sb_rest("POST", "data_quality_log", TOKEN, body=body)
+                load_dq_log.clear()
+                st.success(f"Saved {len(body)} measurements.")
+            except ValueError as e:
+                st.error(f"Could not save: {e}. Run the data_quality_log SQL from the README.")
+        try:
+            lg = load_dq_log(TOKEN)
+            if len(lg):
+                lg["created_at"] = pd.to_datetime(lg["created_at"])
+                agree = lg[lg["metric"].str.contains("pct")]
+                if len(agree):
+                    st.plotly_chart(px.line(agree.sort_values("created_at"), x="created_at", y="value", color="metric", markers=True,
+                                            title="Agreement and detection rates over time (%)", labels={"created_at": "", "value": "%"}),
+                                    use_container_width=True)
+                lat_ = lg[lg["metric"].str.startswith("latency")]
+                if len(lat_):
+                    st.plotly_chart(px.line(lat_.sort_values("created_at"), x="created_at", y="value", color="metric",
+                                            title="Source response time (ms)", labels={"created_at": "", "value": "ms"}),
+                                    use_container_width=True)
+            else:
+                st.info("No snapshots saved yet. Save one now, then again on other days to see trends.")
+        except ValueError as e:
+            st.info(f"Trend log not available yet: {e}")
+    else:
+        st.info("Sign in with Supabase configured to save snapshots and see trends.")
 
 # ---------------------------------------------------------------- incidents
 with tab_inc:
