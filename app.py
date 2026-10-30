@@ -589,6 +589,71 @@ def s2_change(id1, id2, bbox, max_px, _f1, _f2):
     return sentinel.change(_f1, _f2, list(bbox), max_px)
 
 
+PRIORITY_DEFAULT = {"Flood": 40, "Heat": 20, "Air and dust": 20, "Drought": 20}
+
+
+def priority_table(tw, df, inc, weights):
+    """Rank towns by a weighted blend of flood, heat, air and dust, drought, plus a boost for recent severe reports."""
+    reg = [(n, v[0], v[1]) for n, v in REGIONS.items()]
+    wsum = max(sum(weights.values()), 1)
+    recent = None
+    if inc is not None and len(inc) and {"lat", "lon", "created_at", "severity"} <= set(inc.columns):
+        recent = inc.copy()
+        recent["when"] = pd.to_datetime(recent["created_at"], utc=True).dt.tz_localize(None)
+        recent = recent[recent["when"] >= pd.Timestamp.now("UTC").tz_localize(None) - pd.Timedelta(days=14)]
+    rows = []
+    for _, t in tw.iterrows():
+        near = min(reg, key=lambda r: float(hav_km(t["lat"], t["lon"], r[1], r[2])))
+        r = df[df["Region"] == near[0]].iloc[0]
+        comp = {"Flood": float(t["Flood risk (0-100)"]),
+                "Heat": float(np.clip((r["Temp (°C)"] - 30) / 10, 0, 1)) * 100,
+                "Air and dust": float(np.clip(r["PM10 (µg/m³)"] / 150, 0, 1)) * 100,
+                "Drought": float(r["Drought index (0-100)"])}
+        contrib = {k: weights[k] * comp[k] / wsum for k in comp}
+        boost, n_rep = 0.0, 0
+        if recent is not None and len(recent):
+            close = recent[hav_km(t["lat"], t["lon"], recent["lat"].values, recent["lon"].values) <= 10]
+            n_rep = len(close)
+            boost = min(15.0, 5.0 * (close["severity"] == "Severe").sum() + 2.0 * (close["severity"] == "Moderate").sum())
+        top = sorted(contrib, key=contrib.get, reverse=True)[:2]
+        rows.append({"Town": t["Town"], "Region": t["Region"], "Priority score": round(min(100.0, sum(contrib.values()) + boost), 1),
+                     "Main drivers": " and ".join(k for k in top if contrib[k] > 0) or "None", "Flood level": t["Flood level"],
+                     "Reports (14 days)": n_rep, **{f"c_{k}": v for k, v in contrib.items()}, "boost": boost})
+    return pd.DataFrame(rows).sort_values("Priority score", ascending=False).reset_index(drop=True)
+
+
+@st.cache_data(ttl=86400, show_spinner="Reading your field…", max_entries=20)
+def farm_zones(fid, gjson, ha, _f):
+    import sentinel
+    return sentinel.field_map(_f, json.loads(gjson), 600, ha)
+
+
+@st.cache_data(ttl=86400, show_spinner="Comparing your field…", max_entries=10)
+def farm_change(id1, id2, gjson, ha, _f1, _f2):
+    import sentinel
+    return sentinel.field_change(_f1, _f2, json.loads(gjson), 600, ha)
+
+
+def farm_attention(fw):
+    """Weather stress for one farm from 14 past days plus the next 3 (indicative)."""
+    today_ts = pd.Timestamp(date.today())
+    past = fw[fw["time"] < today_ts]
+    dry = 0
+    for v in reversed([x or 0 for x in past["precipitation_sum"].tolist()]):
+        if v >= 1:
+            break
+        dry += 1
+    sm = fw.loc[fw["time"] == today_ts, "soil_moisture_0_to_7cm"]
+    sm = float(sm.iloc[0]) if len(sm) and pd.notna(sm.iloc[0]) else None
+    nxt = fw[(fw["time"] >= today_ts) & (fw["time"] < today_ts + pd.Timedelta(days=3))]
+    hot = float(nxt["temperature_2m_max"].max())
+    rain3 = float(nxt["precipitation_sum"].fillna(0).sum())
+    parts = {"Dry spell": min(dry / 14, 1) * 40, "Dry soil": (1 - min((sm if sm is not None else 0.3) / 0.30, 1)) * 30,
+             "Heat": 15.0 if hot >= T_HEAT else 0.0, "Heavy rain": 15.0 if rain3 >= 50 else 0.0}
+    why = ", ".join(k for k, v in sorted(parts.items(), key=lambda kv: -kv[1]) if v > 0)[:60] or "No stress"
+    return {"dry": dry, "sm": sm, "rain3": rain3, "hot": hot, "score": round(sum(parts.values()), 0), "why": why}
+
+
 def secret(k):
     try:
         v = st.secrets[k]
@@ -1122,6 +1187,33 @@ with tab_map:
     else:
         st.caption("Click anywhere on the map to check the 7-day flood hazard at that point.")
 
+    st.subheader("Where to act first")
+    if tw is None:
+        st.info("The priority list needs the flood data, which is unavailable right now.")
+    else:
+        with st.expander("Adjust how the score is built"):
+            wcols = st.columns(4)
+            weights = {k: wcols[i].slider(k, 0, 100, v, key=f"pw_{k}") for i, (k, v) in enumerate(PRIORITY_DEFAULT.items())}
+        try:
+            pr = priority_table(tw, df, inc, weights)
+            top3 = pr.head(3)
+            kc = st.columns(3)
+            for i, (_, r) in enumerate(top3.iterrows()):
+                kc[i].metric(f"#{i + 1} {r['Town']}", f"{r['Priority score']:.0f} / 100", r["Main drivers"], delta_color="off")
+            st.dataframe(pr[["Town", "Region", "Priority score", "Main drivers", "Flood level", "Reports (14 days)"]],
+                         hide_index=True, use_container_width=True,
+                         column_config={"Priority score": st.column_config.ProgressColumn("Priority score", min_value=0, max_value=100, format="%.0f")})
+            long_ = pr.melt(id_vars=["Town", "Priority score"], value_vars=[f"c_{k}" for k in PRIORITY_DEFAULT] + ["boost"],
+                            var_name="Part", value_name="Points")
+            long_["Part"] = long_["Part"].str.replace("c_", "", regex=False).replace({"boost": "Recent severe reports"})
+            st.plotly_chart(px.bar(long_.sort_values("Priority score"), x="Points", y="Town", color="Part", orientation="h",
+                                   title="What makes up each town's priority score"), use_container_width=True)
+            st.caption("Indicative ranking, not an official risk rating. Score = weighted blend of town flood risk and the nearest "
+                       "region's heat, dust and drought, plus up to 15 points for severe or moderate incident reports within 10 km "
+                       "in the last 14 days. Change the weights above to match your own priorities.")
+        except Exception as e:
+            st.warning(f"Could not build the priority list: {e}")
+
     c1, c2 = st.columns(2)
     c1.plotly_chart(px.bar(df.sort_values(layer), x=layer, y="Region", orientation="h",
                            color=layer, color_continuous_scale="RdYlGn_r", title=f"{layer} by region"),
@@ -1143,6 +1235,26 @@ with tab_flood:
         hi = tw.loc[tw["Flood risk (0-100)"].idxmax()]
         a[3].metric("Highest flood risk", hi["Town"], f"{hi['Flood risk (0-100)']:.0f}/100")
 
+        st.markdown("##### 7-day rain outlook (press play)")
+        view = st.radio("Show", ["Daily rain", "Rain added up so far"], horizontal=True, key="anim_view")
+        recs = []
+        for _, r in tw.iterrows():
+            vals = np.cumsum(r["_rain"]) if view != "Daily rain" else r["_rain"]
+            for d_, v_ in zip(r["_dates"], vals):
+                recs.append({"Town": r["Town"], "lat": r["lat"], "lon": r["lon"], "Date": d_, "Rain (mm)": round(float(v_), 1)})
+        an = pd.DataFrame(recs)
+        if an["Rain (mm)"].max() <= 0:
+            st.info("No rain is forecast in the next 7 days.")
+        else:
+            an["Size"] = an["Rain (mm)"] + 2
+            new_map = hasattr(px, "scatter_map")   # newer Plotly renamed scatter_mapbox to scatter_map
+            fn = px.scatter_map if new_map else px.scatter_mapbox
+            figm = fn(an, lat="lat", lon="lon", size="Size", color="Rain (mm)", animation_frame="Date", hover_name="Town",
+                      hover_data={"lat": False, "lon": False, "Size": False, "Rain (mm)": True}, color_continuous_scale="Blues",
+                      range_color=[0, float(an["Rain (mm)"].max())], size_max=38, zoom=6.6, center={"lat": 13.45, "lon": -15.4}, height=520)
+            figm.update_layout(**({"map_style": "carto-positron"} if new_map else {"mapbox_style": "carto-positron"}),
+                               margin=dict(l=0, r=0, t=0, b=0))
+            st.plotly_chart(figm, use_container_width=True)
         heat = pd.DataFrame(list(tw["_rain"]), index=tw["Town"], columns=tw.iloc[0]["_dates"])
         st.plotly_chart(px.imshow(heat, aspect="auto", color_continuous_scale="Blues",
                                   labels=dict(color="mm"), title="Forecast daily rainfall by town (mm)"),
@@ -1747,6 +1859,135 @@ with tab_farm:
             st.success("No alerts right now (based on the data available).")
         st.caption("Indicative thresholds only. NDVI depends on crop type and growth stage, so compare with earlier weeks and "
                    "with neighbouring fields, and confirm problems on the ground. Satellite photo: Esri World Imagery.")
+
+        # ---- 3. this season vs earlier seasons
+        st.subheader("3. This season compared with earlier seasons")
+        if not weather_ok:
+            st.info("Needs the weather data above.")
+        else:
+            try:
+                span = max((date.today() - active["planted"]).days, 1)
+                cur_mm = float(since["precipitation_sum"].fillna(0).sum())
+                srows = []
+                for k_ in range(1, 6):
+                    y0 = date(active["planted"].year - k_, active["planted"].month, min(active["planted"].day, 28))
+                    y1 = y0 + timedelta(days=span)
+                    if y1 > date.today() - timedelta(days=7):
+                        continue
+                    ser_ = _archive_chunk(round(flat, 3), round(flon, 3), str(y0), str(y1), "precipitation_sum", False)
+                    srows.append({"Season": str(y0.year) if y1.year == y0.year else f"{y0.year}/{str(y1.year)[2:]}",
+                                  "Rain (mm)": round(float(ser_.sum()), 0), "Type": "Earlier season"})
+                srows.append({"Season": "This season", "Rain (mm)": round(cur_mm, 0), "Type": "This season"})
+                sdf = pd.DataFrame(srows)
+                st.plotly_chart(px.bar(sdf, x="Season", y="Rain (mm)", color="Type",
+                                       color_discrete_map={"Earlier season": "#9db7d5", "This season": "#1F8A5B"},
+                                       title=f"Rain over the same {span} days after planting"), use_container_width=True)
+                prev = sdf[sdf["Type"] == "Earlier season"]["Rain (mm)"]
+                if len(prev) and prev.mean() > 0:
+                    diff_ = 100 * (cur_mm - prev.mean()) / prev.mean()
+                    st.caption(f"This season has had {cur_mm:.0f} mm, {abs(diff_):.0f}% {'above' if diff_ >= 0 else 'below'} the "
+                               f"average of the earlier seasons ({prev.mean():.0f} mm) over the same days. "
+                               "For monthly rain, temperature and soil moisture year by year, use the Compare over time tab: "
+                               "your saved farms appear in its place list.")
+            except Exception as e:
+                st.warning(f"Could not load earlier seasons: {e}")
+
+        # ---- 4. zones inside the field
+        st.subheader("4. Look inside the field")
+        fsc_ = fscenes if s2f else []
+        if not fsc_:
+            st.info("Needs Sentinel-2 scenes (see the greenness section above).")
+        else:
+            zl = [f"{f['properties']['datetime'][:10]} ({f['properties'].get('eo:cloud_cover', 0):.0f}% cloud)" for f in fsc_[:10]]
+            zi = st.selectbox("Scene", range(len(zl)), format_func=lambda i: zl[i], key="farm_zone_scene")
+            if st.button("Show zones inside my field"):
+                try:
+                    st.session_state["farm_zone"] = (gjson, fsc_[zi]["id"], farm_zones(fsc_[zi]["id"], gjson, round(fha, 3), fsc_[zi]))
+                except Exception as e:
+                    st.error(f"Could not read this scene: {e}")
+            zz = st.session_state.get("farm_zone")
+            if zz and zz[0] == gjson and zz[1] == fsc_[zi]["id"]:
+                z = zz[2]
+                if not z["ok"]:
+                    st.warning("Too few clear pixels inside your field in this scene. Pick another date.")
+                else:
+                    k = st.columns(4)
+                    k[0].metric("Field mean NDVI", z["mean"])
+                    k[1].metric("Clearly weaker area", f"{z['weak_ha']} ha", f"{100 * z['weak_ha'] / max(fha, 0.01):.0f}% of field", delta_color="off")
+                    k[2].metric("Unevenness", z["spread"], help="Gap between the greener and weaker quarters of the field")
+                    k[3].metric("Clear pixels", f"{z['usable_pct']}%")
+                    mz = folium.Map(location=[flat, flon], zoom_start=17, tiles=None)
+                    folium.TileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                                     attr="Esri World Imagery", name="Satellite photo", max_zoom=19).add_to(mz)
+                    folium.raster_layers.ImageOverlay(image=z["zones_rgba"], bounds=z["bounds"], opacity=0.75, name="Zones").add_to(mz)
+                    folium.raster_layers.ImageOverlay(image=z["ndvi_rgba"], bounds=z["bounds"], opacity=0.75, name="NDVI", show=False).add_to(mz)
+                    folium.GeoJson(active["geom"], name="Field", style_function=lambda _x: {"fill": False, "color": "#ffffff", "weight": 2}).add_to(mz)
+                    folium.LayerControl(collapsed=False).add_to(mz)
+                    st_folium(mz, height=480, use_container_width=True, returned_objects=[], key="farm_zone_map")
+                    st.caption("Red = clearly weaker than this field's typical greenness (NDVI more than 0.10 below the field median), yellow = typical, "
+                               "green = clearly stronger. An even field shows little red. Check whether a red patch matches something you know: "
+                               "poor drainage, pests, thin planting or poor soil. The 0.10 gap is an indicative rule.")
+                    if z["weak_ha"] / max(fha, 0.01) > 0.15:
+                        st.warning("More than 15% of the field is clearly weaker than the rest. Walk the red patch and check water, pests, soil and planting gaps.")
+                    else:
+                        st.success("The field looks fairly even in this scene.")
+
+        # ---- 5. how the field changed
+        st.subheader("5. How the field changed between two dates")
+        if len(fsc_) < 2:
+            st.info("Needs at least two clear Sentinel-2 scenes since planting.")
+        else:
+            cl = [f"{f['properties']['datetime'][:10]} ({f['properties'].get('eo:cloud_cover', 0):.0f}% cloud)" for f in fsc_[:20]]
+            cb, ca = st.columns(2)
+            ib = cb.selectbox("Before", range(len(cl)), index=min(len(cl) - 1, 5), format_func=lambda i: cl[i], key="farm_chg_b")
+            ia = ca.selectbox("After", range(len(cl)), index=0, format_func=lambda i: cl[i], key="farm_chg_a")
+            if st.button("Compare the field on these two dates"):
+                if ib == ia:
+                    st.warning("Pick two different dates.")
+                else:
+                    try:
+                        st.session_state["farm_chg"] = (gjson, fsc_[ib]["id"], fsc_[ia]["id"],
+                                                        farm_change(fsc_[ib]["id"], fsc_[ia]["id"], gjson, round(fha, 3), fsc_[ib], fsc_[ia]))
+                    except Exception as e:
+                        st.error(f"Could not compare: {e}")
+            fc_ = st.session_state.get("farm_chg")
+            if fc_ and fc_[0] == gjson and fc_[1] == fsc_[ib]["id"] and fc_[2] == fsc_[ia]["id"]:
+                c_ = fc_[3]
+                if not c_["ok"]:
+                    st.warning("Too few clear pixels inside your field on one of the dates. Pick other dates.")
+                else:
+                    k = st.columns(4)
+                    k[0].metric("Mean NDVI", c_["mean_after"], f"{c_['mean_change']:+.3f} since {c_['before_date']}")
+                    k[1].metric("Greener", f"{c_['gain_ha']} ha")
+                    k[2].metric("Browner", f"{c_['loss_ha']} ha")
+                    k[3].metric("Clear pixels", f"{c_['usable_pct']}%")
+                    mc_ = folium.Map(location=[flat, flon], zoom_start=17, tiles=None)
+                    folium.TileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                                     attr="Esri World Imagery", name="Satellite photo", max_zoom=19).add_to(mc_)
+                    folium.raster_layers.ImageOverlay(image=c_["diff_rgba"], bounds=c_["bounds"], opacity=0.8, name="Change").add_to(mc_)
+                    folium.GeoJson(active["geom"], name="Field", style_function=lambda _x: {"fill": False, "color": "#ffffff", "weight": 2}).add_to(mc_)
+                    folium.LayerControl(collapsed=False).add_to(mc_)
+                    st_folium(mc_, height=480, use_container_width=True, returned_objects=[], key="farm_chg_map")
+                    st.caption("Green = greener, red = browner, near white = little change. A normal crop gets greener as it grows and browner near harvest, "
+                               "so judge the change against the crop stage and compare with neighbouring fields.")
+
+    if farms is not None and len(farms):
+        st.subheader("All my farms: which needs attention first")
+        arows = []
+        for _, fr_ in farms.head(12).iterrows():
+            try:
+                fwx = load_farm_weather(float(fr_["lat"]), float(fr_["lon"]), 14)
+                a_ = farm_attention(fwx)
+                arows.append({"Farm": fr_["name"], "Crop": fr_["crop"], "Attention score": a_["score"], "Main reasons": a_["why"],
+                              "Days without rain": a_["dry"], "Soil moisture": None if a_["sm"] is None else round(a_["sm"], 2),
+                              "Rain next 3 days (mm)": round(a_["rain3"], 0), "Max temp next 3 days": round(a_["hot"], 0)})
+            except Exception:
+                pass
+        if arows:
+            st.dataframe(pd.DataFrame(arows).sort_values("Attention score", ascending=False), hide_index=True, use_container_width=True,
+                         column_config={"Attention score": st.column_config.ProgressColumn("Attention score", min_value=0, max_value=100, format="%.0f")})
+            st.caption("Indicative weather stress only: dry spell (up to 40 points), dry soil (30), heat (15) and heavy rain forecast (15). "
+                       "It does not include crop greenness. Open a farm above to see its satellite analysis.")
 
 # ---------------------------------------------------------------- data quality
 with tab_dq:

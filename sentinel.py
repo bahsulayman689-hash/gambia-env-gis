@@ -178,3 +178,61 @@ def change(f1, f2, bbox, max_px):
             "usable_pct": round(100 * float(ok.mean()), 1), "diff": d, "bounds": bounds,
             "diff_rgba": colorize_diff(d), "before_rgba": colorize(v1), "after_rgba": colorize(v2),
             "seconds": round(time.perf_counter() - t, 1), "pixels": int(d.size)}
+
+
+def _field_v(f, geom, max_px, shape=None):
+    """NDVI window around a polygon, with pixels outside the polygon set to NaN."""
+    from rasterio.features import geometry_mask
+    from rasterio.transform import from_bounds as tfb
+    from rasterio.warp import transform_geom
+    ring = geom["coordinates"][0]
+    xs, ys = [c[0] for c in ring], [c[1] for c in ring]
+    pad = 0.0005
+    bbox = [min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad]
+    with rasterio.Env(**ENV), rasterio.open(f["assets"]["red"]["href"]) as ds:
+        crs = ds.crs
+        b = transform_bounds("EPSG:4326", crs, *bbox)
+    v, cloud, bounds, shp = ndvi(f, bbox, max_px, shape=shape)
+    inside = geometry_mask([transform_geom("EPSG:4326", crs, geom)], out_shape=v.shape,
+                           transform=tfb(*b, v.shape[1], v.shape[0]), invert=True, all_touched=True)
+    return np.where(inside, v, np.nan), inside, bounds, shp, cloud
+
+
+def field_map(f, geom, max_px=600, ha=1.0):
+    """Within-field zones: clearly weaker (more than 0.10 NDVI below the field median), typical, clearly stronger."""
+    v, inside, bounds, shp, cloud = _field_v(f, geom, max_px)
+    ok = ~np.isnan(v)
+    base = {"id": f["id"], "date": f["properties"]["datetime"][:10], "cloud_pct": round(float(cloud), 1),
+            "usable_pct": round(100 * float(ok.sum()) / max(int(inside.sum()), 1), 1), "bounds": bounds}
+    if ok.sum() < 4:
+        return {**base, "ok": False}
+    p10, p25, p50, p75, p90 = np.percentile(v[ok], [10, 25, 50, 75, 90])
+    cls = np.full(v.shape, np.nan)
+    cls[ok & (v < p50 - 0.10)] = 0                       # clearly below the field's typical greenness
+    cls[ok & (v >= p50 - 0.10) & (v <= p50 + 0.10)] = 1  # typical
+    cls[ok & (v > p50 + 0.10)] = 2                       # clearly above
+    cols = np.array([[200, 55, 45], [245, 215, 90], [31, 138, 91]], np.uint8)
+    zr = np.zeros(v.shape + (4,), np.uint8)
+    idx = np.nan_to_num(cls, nan=0).astype(int)
+    zr[..., :3] = cols[idx]
+    zr[..., 3] = np.where(ok, 215, 0)
+    ha_px = ha / max(int(inside.sum()), 1)
+    return {**base, "ok": True, "mean": round(float(v[ok].mean()), 3), "median": round(float(p50), 3),
+            "spread": round(float(p75 - p25), 3), "weak_ha": round(float((cls == 0).sum() * ha_px), 2),
+            "zones_rgba": zr, "ndvi_rgba": colorize(v)}
+
+
+def field_change(f1, f2, geom, max_px=600, ha=1.0):
+    """NDVI change inside a field between two scenes (after minus before)."""
+    v1, inside, bounds, shp, c1 = _field_v(f1, geom, max_px)
+    v2, _, _, _, c2 = _field_v(f2, geom, max_px, shape=shp)
+    d = v2 - v1
+    ok = ~np.isnan(d)
+    if ok.sum() < 4:
+        return {"ok": False, "before_date": f1["properties"]["datetime"][:10], "after_date": f2["properties"]["datetime"][:10]}
+    ha_px = ha / max(int(inside.sum()), 1)
+    return {"ok": True, "before_date": f1["properties"]["datetime"][:10], "after_date": f2["properties"]["datetime"][:10],
+            "mean_before": round(float(np.nanmean(v1)), 3), "mean_after": round(float(np.nanmean(v2)), 3),
+            "mean_change": round(float(d[ok].mean()), 3), "gain_ha": round(float((d[ok] > 0.1).sum() * ha_px), 2),
+            "loss_ha": round(float((d[ok] < -0.1).sum() * ha_px), 2), "diff_rgba": colorize_diff(d), "bounds": bounds,
+            "usable_pct": round(100 * float(ok.sum()) / max(int(inside.sum()), 1), 1)}

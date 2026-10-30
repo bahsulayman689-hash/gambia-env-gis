@@ -181,6 +181,10 @@ Each user sees only their own farms. Satellite photo tiles come from Esri World 
 
 The **Compare over time** tab (1) compares up to 4 places (towns, your saved farms, or a custom point) month by month for rainfall, temperature, soil moisture, evapotranspiration, wind or Sentinel-2 NDVI, over 1 to 10 years, as side-by-side lines, year-over-year lines or difference from normal, with a latest-12-months vs earlier-years table; and (2) maps how one place changed between two date ranges using the clearest Sentinel-2 scene in each. History comes from the Open-Meteo archive (model reanalysis, not station measurements).
 
+### Farm analysis
+
+For a located farm the **Farm monitor** tab also shows: this season's rain against earlier seasons over the same days after planting; a zone map inside the field (clearly weaker, typical, clearly stronger greenness from Sentinel-2); a before/after change map of the field; and, for signed-in users with several saved farms, a ranking of which farm has the most weather stress. All thresholds are indicative.
+
 ### Supabase table
 
 ```sql
