@@ -1,0 +1,35 @@
+crop,stage,start_day,end_day,ndvi_expectation,watch,water_critical,ndvi_falls
+Groundnut,Emergence,0,10,"Low, starting to rise","Check germination and replant gaps early",0,0
+Groundnut,Vegetative growth,10,35,"Rising","Weed early while the leaves build",0,0
+Groundnut,Flowering and pegging,35,60,"Rising towards its peak","Water matters most now",1,0
+Groundnut,Pod filling,60,95,"Near peak, then slowly falling","Water matters most now",1,0
+Groundnut,Maturity and harvest,95,120,"Falling as the crop ripens","Plan harvest as leaves yellow",0,1
+Rice,Establishment,0,20,"Low, starting to rise","Keep seedlings supplied with water",0,0
+Rice,Tillering,20,55,"Rising","Control weeds and keep the field watered",0,0
+Rice,Panicle and flowering,55,95,"Near peak","Water matters most now",1,0
+Rice,Grain filling,95,120,"Slowly falling","Water matters most now",1,0
+Rice,Ripening and harvest,120,140,"Falling as the crop ripens","Plan drainage and harvest",0,1
+Millet,Emergence,0,10,"Low, starting to rise","Check germination and replant gaps early",0,0
+Millet,Vegetative growth,10,40,"Rising","Weed early and thin where needed",0,0
+Millet,Flowering,40,65,"Near peak","Water matters most now",1,0
+Millet,Grain filling,65,90,"Slowly falling","Water matters most now",1,0
+Millet,Maturity,90,110,"Falling as the crop ripens","Plan harvest and bird control",0,1
+Maize,Emergence,0,10,"Low, starting to rise","Check germination and replant gaps early",0,0
+Maize,Vegetative growth,10,50,"Rising","Weed early and feed the crop",0,0
+Maize,Tasseling and silking,50,70,"Near peak","Water matters most now",1,0
+Maize,Grain filling,70,100,"Slowly falling","Water matters most now",1,0
+Maize,Maturity,100,120,"Falling as the crop ripens","Plan drying and harvest",0,1
+Sorghum,Emergence,0,10,"Low, starting to rise","Check germination and replant gaps early",0,0
+Sorghum,Vegetative growth,10,50,"Rising","Weed early",0,0
+Sorghum,Flowering,50,75,"Near peak","Water matters most now",1,0
+Sorghum,Grain filling,75,105,"Slowly falling","Water matters most now",1,0
+Sorghum,Maturity,105,130,"Falling as the crop ripens","Plan harvest and bird control",0,1
+Cowpea,Emergence,0,7,"Low, starting to rise","Check germination",0,0
+Cowpea,Vegetative growth,7,30,"Rising","Weed early",0,0
+Cowpea,Flowering,30,45,"Near peak","Water matters most now",1,0
+Cowpea,Pod filling,45,65,"Slowly falling","Water matters most now",1,0
+Cowpea,Maturity,65,85,"Falling as the crop ripens","Harvest pods as they dry",0,1
+Cassava,Establishment,0,60,"Low, rising slowly","Young plants are sensitive to dry spells",1,0
+Cassava,Canopy growth,60,150,"Rising","Weed until the canopy closes",0,0
+Cassava,Root bulking,150,270,"Near peak","Keep an eye on pests and disease",0,0
+Cassava,Maturity,270,365,"Plateau, then slowly falling","Harvest when roots reach the size you need",0,0
