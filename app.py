@@ -8,6 +8,7 @@ import hmac
 import html
 import io
 import json
+import re
 import time
 import uuid
 from datetime import date, datetime, timedelta
@@ -24,6 +25,8 @@ import requests
 import streamlit as st
 from folium.plugins import Draw, Fullscreen, HeatMap, MiniMap
 from streamlit_folium import st_folium
+
+import farm_rules
 
 st.set_page_config(page_title="Gambia Environmental GIS", page_icon="🌍", layout="wide")
 
@@ -1715,7 +1718,9 @@ with tab_farm:
     if saved_choice is not None:
         gg = json.loads(saved_choice["geojson"])
         active = {"name": saved_choice["name"], "crop": saved_choice["crop"], "geom": gg, "id": saved_choice["id"],
-                  "planted": pd.to_datetime(saved_choice["planting_date"]).date() if saved_choice.get("planting_date") else date.today() - timedelta(days=30)}
+                  "planted": pd.to_datetime(saved_choice["planting_date"]).date() if saved_choice.get("planting_date") else date.today() - timedelta(days=30),
+                  "phone": saved_choice.get("phone") if isinstance(saved_choice.get("phone"), str) else "",
+                  "alerts_on": bool(saved_choice.get("alerts_on")) if pd.notna(saved_choice.get("alerts_on")) else False}
     elif st.session_state.get("farm_draw"):
         g0 = st.session_state["farm_draw"]
         if g0["type"] == "Point":
@@ -1729,7 +1734,11 @@ with tab_farm:
             nm = f1.text_input("Farm name", "My farm", key="farm_name")
             cr = f2.selectbox("Crop", CROPS, key="farm_crop")
             pl = f3.date_input("Planting date", value=date.today() - timedelta(days=30), key="farm_plant")
-            active = {"name": nm, "crop": cr, "geom": gg, "id": None, "planted": pl}
+            g1, g2 = st.columns([1, 2])
+            ph_new = g1.text_input("Phone for SMS alerts (optional)", placeholder="+220...", key="farm_phone")
+            agree_new = g2.checkbox("I agree to receive SMS alerts about this farm and can turn them off at any time.", key="farm_agree")
+            active = {"name": nm, "crop": cr, "geom": gg, "id": None, "planted": pl,
+                      "phone": ph_new.strip() if agree_new else "", "alerts_on": bool(agree_new and ph_new.strip())}
     if active is None:
         st.info("Draw your field or drop a marker on the map (or open a saved farm) to start monitoring.")
     else:
@@ -1741,7 +1750,7 @@ with tab_farm:
                 try:
                     sb_rest("POST", "farms", TOKEN, body={"name": active["name"], "crop": active["crop"],
                             "planting_date": str(active["planted"]), "lat": flat, "lon": flon, "area_ha": round(fha, 2),
-                            "geojson": gjson})
+                            "geojson": gjson, **({"phone": active["phone"], "alerts_on": True} if active.get("alerts_on") else {})})
                     load_farms.clear()
                     st.success("Saved. It now shows on the main map and in the saved farms list.")
                 except ValueError as e:
@@ -1753,11 +1762,49 @@ with tab_farm:
                     st.rerun()
                 except ValueError as e:
                     st.error(str(e))
+            if active["id"] is not None:
+                with st.expander("SMS alerts for this farm"):
+                    ph2 = st.text_input("Phone number with country code", value=active.get("phone") or "", placeholder="+220...", key=f"ph_{active['id']}")
+                    ag2 = st.checkbox("I agree to receive SMS alerts about this farm. I can turn them off here at any time.",
+                                      value=bool(active.get("alerts_on")), key=f"ag_{active['id']}")
+                    if st.button("Save alert settings", key=f"sa_{active['id']}"):
+                        if ag2 and not re.fullmatch(r"\+\d{8,15}", ph2.strip()):
+                            st.error("Enter the number with a + and country code, for example +2203001234.")
+                        else:
+                            try:
+                                sb_rest("PATCH", "farms", TOKEN, params={"id": f"eq.{active['id']}"},
+                                        body={"phone": ph2.strip() or None, "alerts_on": bool(ag2 and ph2.strip())})
+                                load_farms.clear()
+                                st.success("Saved. Alerts are sent once a day, only when a condition needs attention.")
+                            except ValueError as e:
+                                st.error(f"Could not save: {e}. Run the alert SQL from the README.")
         else:
             sv2.caption("Sign in (with Supabase set up) to save farms. Unsaved farms last for this session only.")
 
         st.subheader(f"2. Monitoring: {active['name']} ({active['crop']})")
         days_since = max((date.today() - active["planted"]).days, 0)
+        cal_ = farm_rules.load_calendar()
+        stg = farm_rules.current_stage(active["crop"], days_since, cal_)
+        if stg:
+            tot = farm_rules.season_length(active["crop"], cal_)
+            s1, s2 = st.columns([1, 2])
+            s1.metric("Crop stage", stg["stage"], f"day {days_since} of about {tot}", delta_color="off")
+            s2.markdown(f"**Greenness should be:** {stg['ndvi_expectation']}  \n**Watch for:** {stg['watch']}")
+            st.progress(min(days_since / max(tot, 1), 1.0))
+            fst = pgo.Figure()
+            for r_ in farm_rules.stages(active["crop"], cal_):
+                fst.add_trace(pgo.Bar(y=[""], x=[r_["end_day"] - r_["start_day"]], base=r_["start_day"], orientation="h",
+                                      name=r_["stage"], text=r_["stage"], textposition="inside", insidetextanchor="middle",
+                                      marker_color="#d9a441" if r_["water_critical"] else "#9db7d5",
+                                      hovertemplate=f"{r_['stage']}: day {r_['start_day']} to {r_['end_day']}<extra></extra>"))
+            fst.add_vline(x=days_since, line_color="#C8372D", line_width=3, annotation_text="today")
+            fst.update_layout(barmode="overlay", height=150, showlegend=False, margin=dict(l=0, r=0, t=30, b=0),
+                              xaxis_title="Days since planting", title="Growth stages (gold = water-sensitive)")
+            st.plotly_chart(fst, use_container_width=True)
+            st.caption("Stage dates are indicative defaults from general crop durations (data/crop_calendar.csv). Real timing depends on the "
+                       "variety, sowing date and season, so replace them with values from your extension service.")
+        else:
+            st.caption("No crop calendar for this crop yet. Add rows to data/crop_calendar.csv.")
         try:
             fw = load_farm_weather(flat, flon, int(min(max(days_since + 3, 14), 90)))
             today_ts = pd.Timestamp(date.today())
@@ -1830,6 +1877,12 @@ with tab_farm:
                     ftr.add_trace(pgo.Scatter(x=trend["date"], y=trend["mean_ndvi"], mode="lines+markers", name="Mean NDVI",
                                               line=dict(color="#1F8A5B")))
                     ftr.update_layout(title="Field NDVI over time (clear pixels only)", yaxis_title="NDVI")
+                    for i_, r_ in enumerate(farm_rules.stages(active["crop"], cal_)):
+                        ftr.add_vrect(x0=str(active["planted"] + timedelta(days=r_["start_day"])),
+                                      x1=str(active["planted"] + timedelta(days=r_["end_day"])),
+                                      fillcolor="#d9a441" if r_["water_critical"] else "#9db7d5", opacity=0.10 if i_ % 2 else 0.18,
+                                      line_width=0, annotation_text=r_["stage"], annotation_position="top left",
+                                      annotation_font_size=10)
                     st.plotly_chart(ftr, use_container_width=True)
                     st.dataframe(trend[["date", "mean_ndvi", "p10", "p90", "valid_pct", "cloud_pct"]], hide_index=True,
                                  use_container_width=True)
@@ -1838,25 +1891,25 @@ with tab_farm:
 
         st.markdown("##### Alerts for this field")
         al = []
+        notes = []
         if weather_ok:
-            if dry >= 7:
-                al.append(f"No meaningful rain (under 1 mm) for {dry} days.")
-            if sm_now is not None and sm_now < 0.10:
-                al.append(f"Topsoil is dry (moisture {sm_now:.2f}).")
-            if nxt["temperature_2m_max"].max() >= T_HEAT:
-                al.append(f"Heat: up to {nxt['temperature_2m_max'].max():.0f}°C in the next 3 days.")
-            if nxt["precipitation_sum"].fillna(0).sum() >= 50:
-                al.append(f"Heavy rain forecast: {nxt['precipitation_sum'].fillna(0).sum():.0f} mm in 3 days (waterlogging or flood risk).")
+            al += farm_rules.weather_alerts(dry, sm_now, float(nxt["temperature_2m_max"].max()),
+                                            float(nxt["precipitation_sum"].fillna(0).sum()), stg, T_HEAT)
         if trend is not None and len(trend) >= 2:
             d_ = float(trend["mean_ndvi"].iloc[-1] - trend["mean_ndvi"].iloc[-2])
             if d_ <= -0.10:
-                al.append(f"Greenness fell by {abs(d_):.2f} NDVI between {trend['date'].iloc[-2]} and {trend['date'].iloc[-1]}. "
-                          "Possible stress, flooding, pests, harvest or cloud haze: check the field.")
+                if stg and stg.get("ndvi_falls"):
+                    notes.append(f"Greenness fell by {abs(d_):.2f} NDVI, which is expected at this stage ({stg['stage'].lower()}).")
+                else:
+                    al.append(f"Greenness fell by {abs(d_):.2f} NDVI between {trend['date'].iloc[-2]} and {trend['date'].iloc[-1]}. "
+                              "Possible stress, flooding, pests, harvest or cloud haze: check the field.")
         if al:
             for a_ in al:
                 st.warning(a_)
         else:
             st.success("No alerts right now (based on the data available).")
+        for n_ in notes:
+            st.info(n_)
         st.caption("Indicative thresholds only. NDVI depends on crop type and growth stage, so compare with earlier weeks and "
                    "with neighbouring fields, and confirm problems on the ground. Satellite photo: Esri World Imagery.")
 
