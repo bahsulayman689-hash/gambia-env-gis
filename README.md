@@ -138,6 +138,47 @@ create policy "avatar update" on storage.objects for update to authenticated
 
 Signed-in users upload from the sidebar (**Change profile photo**). The photo is cropped to a square, resized to 256 px and shown in a circle in the sidebar and the top banner. Without sign-in the photo lasts only for the current session.
 
+### Data quality log
+
+The **Data quality** tab checks source health, FIRMS cross-sensor agreement and fire reports against satellite detections. To save snapshots and see trends, run once in the Supabase SQL Editor:
+
+```sql
+create table data_quality_log (
+  id bigint generated always as identity primary key,
+  created_at timestamptz default now(),
+  source text, metric text, value float8, note text
+);
+alter table data_quality_log enable row level security;
+create policy "read dq" on data_quality_log for select to authenticated using (true);
+create policy "insert dq" on data_quality_log for insert to authenticated with check (true);
+```
+
+These checks measure consistency and agreement. They are not an absolute accuracy score.
+
+### Farm monitor (locate a farm)
+
+Search a village, enter coordinates, or draw the field on a satellite photo (polygon, rectangle or marker). The app then shows rain since planting, days without rain, soil moisture, a rain and soil chart, Sentinel-2 NDVI measured only inside the field, and alerts (dry spell, dry soil, heat, heavy rain, NDVI drop). Saving farms needs sign-in and this SQL, run once in the Supabase SQL Editor:
+
+```sql
+create table farms (
+  id bigint generated always as identity primary key,
+  created_at timestamptz default now(),
+  owner uuid default auth.uid(),
+  name text, crop text, planting_date date,
+  lat float8, lon float8, area_ha float8, geojson text
+);
+alter table farms enable row level security;
+create policy "own farms read" on farms for select to authenticated using (owner = auth.uid());
+create policy "own farms insert" on farms for insert to authenticated with check (owner = auth.uid());
+create policy "own farms delete" on farms for delete to authenticated using (owner = auth.uid());
+```
+
+Each user sees only their own farms. Satellite photo tiles come from Esri World Imagery; check its terms before commercial use.
+
+### Compare over time
+
+The **Compare over time** tab (1) compares up to 4 places (towns, your saved farms, or a custom point) month by month for rainfall, temperature, soil moisture, evapotranspiration, wind or Sentinel-2 NDVI, over 1 to 10 years, as side-by-side lines, year-over-year lines or difference from normal, with a latest-12-months vs earlier-years table; and (2) maps how one place changed between two date ranges using the clearest Sentinel-2 scene in each. History comes from the Open-Meteo archive (model reanalysis, not station measurements).
+
 ### Supabase table
 
 ```sql
